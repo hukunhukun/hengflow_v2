@@ -1,6 +1,6 @@
 {
   "name": "hengflow-v2",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Standalone cost-aware multi-model agent runtime",
   "type": "module",
   "bin": {

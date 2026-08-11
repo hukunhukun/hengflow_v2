@@ -325,9 +325,15 @@ Print 模式在标准回答之外，会输出任务板与成本面板，适合�
 | --- | --- | --- |
 | `HENGFLOW_AGENT_DIR` | 配置、认证和模型数据目录 | `~/.hengflow/agent` |
 | `HENGFLOW_DATA_DIR` | SQLite 等运行数据目录 | `<agentDir>/data` |
-| `HTTPS_PROXY` / `HTTP_PROXY` | 网络代理 | 未设置时读取运行时设置 |
+| `HTTPS_PROXY` / `HTTP_PROXY` | 可选网络代理 | 默认不配置 |
 
-当前网络层在未发现任何代理配置时会回退到 `http://127.0.0.1:7897`。如果本机没有该代理，请显式设置可用代理或在运行时设置中调整。
+HengFlow 默认直接连接网络，不主动设置代理。需要代理时，请显式设置 `HTTPS_PROXY` / `HTTP_PROXY` 环境变量，或在运行时全局设置中配置 `httpProxy`。
+
+```bash
+export HTTPS_PROXY=http://127.0.0.1:7897
+export HTTP_PROXY=http://127.0.0.1:7897
+hengflow-v2
+```
 
 ## 凭证与安全
 

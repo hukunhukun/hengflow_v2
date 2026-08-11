@@ -5,7 +5,7 @@ import { authStatus, importApiKeys } from "./auth.js";
 import { getAgentDir, loadConfig } from "./config.js";
 import { configureNetworkProxy } from "./network.js";
 
-const VERSION = "0.7.0";
+const VERSION = "0.7.1";
 
 // Node 22-25 marks the built-in SQLite module experimental even though the API
 // is available. Suppress only that one warning so every CLI startup stays clean.
