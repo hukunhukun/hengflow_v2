@@ -1,0 +1,36 @@
+{
+  "name": "hengflow-v2",
+  "version": "0.7.0",
+  "description": "Standalone cost-aware multi-model agent runtime",
+  "type": "module",
+  "bin": {
+    "hengflow-v2": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/cli.ts",
+    "test": "npm run build && node --test dist/test/*.test.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "node dist/cli.js"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "dependencies": {
+    "@hengflow/agent-runtime": "npm:@earendil-works/pi-coding-agent@0.84.1",
+    "@hengflow/tui": "npm:@earendil-works/pi-tui@0.84.1",
+    "typebox": "1.3.7",
+    "undici": "8.5.0"
+  },
+  "devDependencies": {
+    "@types/node": "24.12.4",
+    "tsx": "4.20.6",
+    "typescript": "5.9.3"
+  },
+  "license": "MIT"
+}
