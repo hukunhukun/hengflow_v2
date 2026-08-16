@@ -159,7 +159,7 @@ test("keeps writes and high-risk planned items on the Manager", () => {
   store.close();
 });
 
-test("bounded Lyapunov exploration gives under-sampled DeepSeek a finite chance", () => {
+test("bounded sample-deficit exploration gives under-sampled DeepSeek a finite chance", () => {
   const store = ledger();
   const task: DelegatedTask = {
     id: "explore-research", objective: "research bounded facts", kind: "research", risk: "low", complexity: 0.5,
@@ -172,7 +172,7 @@ test("bounded Lyapunov exploration gives under-sampled DeepSeek a finite chance"
   assert.equal(explored.selected.id, "deepseek");
   assert.equal(state.selections, 1);
   assert.ok(state.spentUsd > 0 && state.spentUsd <= DEFAULT_CONFIG.routing.explorationBudgetUsd);
-  assert.match(explored.explanation.join(" "), /Lyapunov势能缺口/);
+  assert.match(explored.explanation.join(" "), /样本缺口/);
   state.spentUsd = DEFAULT_CONFIG.routing.explorationBudgetUsd;
   assert.equal(routeTask(task, DEFAULT_CONFIG, store, new Set(["deepseek", "glm"]), state).selected.id, "glm");
   store.close();

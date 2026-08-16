@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import type { ExtensionAPI, ExtensionContext, Theme } from "./runtime/agent.js";
 import { Type } from "typebox";
 import { saveModelSelection, type HengFlowConfig } from "./config.js";
-import { estimateCost, usageShadowCost, workerShadowCost } from "./cost.js";
+import { estimateCost, emptyUsage, usageShadowCost, workerShadowCost } from "./cost.js";
 import {
   renderDashboard,
   renderHengFlowFooter,
@@ -11,7 +11,8 @@ import {
   type PanelPalette,
 } from "./dashboard.js";
 import { UsageLedger } from "./ledger.js";
-import { routePlannedTask, type ExplorationState } from "./router.js";
+import { evaluateSplit, routePlannedTask, type ExplorationState } from "./router.js";
+import { BudgetController } from "./budget-controller.js";
 import { buildTaskContext, chooseContextPolicy } from "./context-policy.js";
 import { validateTaskGraph } from "./graph.js";
 import { StageOrchestrator } from "./orchestrator.js";
@@ -30,12 +31,14 @@ import {
 } from "./task-board.js";
 import type {
   ContextPolicy,
+  DelegatedTask,
   LearnedProfile,
   ExecutionMode,
   PlannedTask,
   ReturnPolicy,
   ModelRef,
   CostBreakdown,
+  RouteDecision,
   TaskBoard,
   TaskOutcome,
   TaskStatus,
@@ -126,6 +129,21 @@ interface ActiveStage {
   kick: () => void;
 }
 
+function budgetBlockedResult(task: DelegatedTask, route: RouteDecision, message: string): WorkerResult {
+  return {
+    task,
+    route,
+    output: message,
+    exitCode: 1,
+    durationMs: 0,
+    usage: emptyUsage(),
+    stopReason: "budget",
+    error: message,
+    retried: false,
+    attempts: [],
+  };
+}
+
 function formatWorkerResults(results: Awaited<ReturnType<typeof runWorker>>[]): string {
   return results.map((result) => {
     const status = result.exitCode === 0 && result.stopReason !== "error" ? "ok" : "failed";
@@ -190,6 +208,8 @@ export function createHengFlowExtension(config: HengFlowConfig) {
     const pendingDelegations = new Map<string, Map<string, WorkerResult>>();
     const activeStages = new Map<string, ActiveStage>();
     const exploration: ExplorationState = { spentUsd: 0, selections: 0 };
+    const budget = new BudgetController(ledger, config);
+    let economicsOverridden = false;
 
     // Keep rendering summaries from older sessions, but new runs no longer append a duplicate completed board.
     pi.registerEntryRenderer<TaskBoard>(TASK_SUMMARY_ENTRY, (entry, _options, theme) =>
@@ -417,6 +437,18 @@ export function createHengFlowExtension(config: HengFlowConfig) {
       footerPhase = "planning";
       planRequired = requiresPlan(event.prompt);
       planCreated = false;
+      economicsOverridden = false;
+      budget.registerSession(config.budget.sessionUsdLimit);
+      const budgetProviders = new Set([
+        config.manager.provider,
+        ...discoveredWorkerModels.map((worker) => worker.provider),
+        ...Object.keys(config.budget.providerLimitsUsd),
+      ]);
+      for (const provider of budgetProviders) {
+        const limit = config.budget.providerLimitsUsd[provider];
+        if (limit && limit > 0) budget.registerProvider(provider, limit);
+      }
+      budget.advanceTracked();
       lastManagerStopReason = undefined;
       currentBoard = undefined;
       clearLivePanel(ctx);
@@ -460,6 +492,7 @@ export function createHengFlowExtension(config: HengFlowConfig) {
         message.stopReason,
         managerTurnStartedAt ? Date.now() - managerTurnStartedAt : 0,
       );
+      budget.advanceTracked();
     });
 
     pi.on("after_provider_response", (event, ctx) => {
@@ -535,6 +568,37 @@ export function createHengFlowExtension(config: HengFlowConfig) {
             { ...taskContext, estimatedTokens: taskContext.estimatedTokens + dependencyTokens },
           );
         });
+        // P2 economics gate: validate the Manager's decomposition against the
+        // full-path cost model before committing. A rejected plan can be
+        // resubmitted once (economicsOverridden) so the Manager stays the
+        // proposer while the Harness acts as economic validator.
+        if (!economicsOverridden && params.mode !== "direct_manager" && effectiveTasks.length > 1) {
+          const split = evaluateSplit({
+            rationale: params.rationale,
+            directEstimatedInputTokens: Math.max(parentContext.estimatedTokens, config.routing.managerControlInputTokens),
+            directEstimatedOutputTokens: Math.min(
+              4000,
+              800 + effectiveTasks.reduce((sum, task) => sum + task.estimatedOutputTokens, 0) * 0.6,
+            ),
+            parallelizable: effectiveTasks.filter((task) => !(task.dependsOn?.length)).length >= 2,
+            tasks: effectiveTasks,
+          }, config);
+          if (!split.accepted) {
+            economicsOverridden = true;
+            return {
+              content: [{
+                type: "text",
+                text: [
+                  "执行图未通过分解经济学评估（全路径成本 vs Manager 直接执行）：",
+                  ...split.reasons.map((reason) => `- ${reason}`),
+                  "请简化任务、合并低复杂度节点，或改用 direct_manager；确认原拆分仍有必要时，可再次调用 execute_plan 覆盖本次评估。",
+                ].join("\n"),
+              }],
+              details: { board: currentBoard, split },
+              isError: true,
+            };
+          }
+        }
         const planningInputTokens = Math.max(parentContext.estimatedTokens, config.routing.managerControlInputTokens);
         const planningCostUsd = estimateCost(
           config.manager,
@@ -547,7 +611,7 @@ export function createHengFlowExtension(config: HengFlowConfig) {
           const decision = routePlannedTask(task, config, ledger, eligibleWorkers, {
             returnPolicy: params.returnPolicy,
             planningCostShareUsd,
-          }, exploration);
+          }, exploration, budget);
           recordPlanDecision(decision);
           return { task, decision };
         });
@@ -584,15 +648,7 @@ export function createHengFlowExtension(config: HengFlowConfig) {
           config.routing.maxConcurrency,
           controller.signal,
           {
-            launch: ({ task, decision }) => runWorker(
-              task,
-              decision.workerRoute!,
-              ctx.cwd,
-              config,
-              buildTaskContext(task, parentContext, orchestrator.results),
-              controller.signal,
-              (progress) => publishWorkerProgress(ctx, progress),
-            ),
+            launch: ({ task, decision }) => launchRoutedTask(task, decision),
             onTransition: (taskId, status, result, error) => {
               if (!currentBoard) return;
               const routedItem = routed.find(({ task }) => task.id === taskId)!;
@@ -622,6 +678,63 @@ export function createHengFlowExtension(config: HengFlowConfig) {
             },
           },
         );
+
+        // Lazy routing (P2): plan-time decisions are tentative; the launch
+        // callback re-routes with the freshest budget/learning state and the
+        // actual dependency outputs available by then.
+        const launchRoutedTask = async (
+          task: PlannedTask,
+          planDecision: (typeof routed)[number]["decision"],
+        ): Promise<WorkerResult> => {
+          const eligible = params.mode === "direct_manager" ? [] : workers;
+          const fresh = routePlannedTask(task, config, ledger, eligible, {
+            returnPolicy: params.returnPolicy,
+            planningCostShareUsd,
+          }, exploration, budget);
+          const runPlanned = () => runWorker(
+            task,
+            planDecision.workerRoute!,
+            ctx.cwd,
+            config,
+            buildTaskContext(task, parentContext, orchestrator.results),
+            controller.signal,
+            (progress) => publishWorkerProgress(ctx, progress),
+          );
+          if (fresh.route !== "manager" && fresh.workerRoute) {
+            ledger.recordDecision(fresh.workerRoute, "launch");
+            const rerouted = fresh.model.provider !== planDecision.model.provider
+              || fresh.model.model !== planDecision.model.model;
+            if (rerouted && currentBoard) {
+              currentBoard = updateBoardItem(currentBoard, task.id, "running", {
+                model: fresh.model.model,
+                note: `launch 重路由 ${planDecision.model.provider}/${planDecision.model.model} → ${fresh.model.provider}/${fresh.model.model}（最新预算/学习状态）`,
+              });
+              publishBoard(ctx, false);
+            }
+            const feasibility = budget.checkFeasibility(fresh.predictedCostUsd, budget.scopesFor(fresh.model));
+            if (!feasibility.feasible) {
+              ctx.ui.notify(`任务 ${task.id} ${feasibility.reason}；节点已暂停，等待 Manager 决策`, "error");
+              return budgetBlockedResult(task, fresh.workerRoute, `${feasibility.reason}；DAG 节点已暂停`);
+            }
+            await budget.waitForAdmission(budget.scopesFor(fresh.model), controller.signal);
+            return runWorker(
+              task,
+              fresh.workerRoute,
+              ctx.cwd,
+              config,
+              buildTaskContext(task, parentContext, orchestrator.results),
+              controller.signal,
+              (progress) => publishWorkerProgress(ctx, progress),
+            );
+          }
+          if (fresh.explanation[0]?.includes("预算不可行")) {
+            ctx.ui.notify(`任务 ${task.id} 在启动时预算不可行；节点已暂停，等待 Manager 决策`, "error");
+            return budgetBlockedResult(task, planDecision.workerRoute!, fresh.explanation.join("；"));
+          }
+          // Quality-margin flips at launch keep the plan-time commitment to
+          // avoid thrashing; only budget infeasibility pauses the node.
+          return runPlanned();
+        };
 
         const stage: ActiveStage = {
           id: delegationId, returnPolicy: params.returnPolicy, tasks: effectiveTasks,
@@ -941,7 +1054,9 @@ export function createHengFlowExtension(config: HengFlowConfig) {
           `Manager: ${config.manager.provider}/${config.manager.model}:${config.manager.thinking}`,
           `Workers (${workers.length}): ${workers.map((worker) => `${worker.id}:${worker.thinking}`).join(", ") || "none selected or authenticated"}`,
           `Routing: margin=${(config.routing.splitImprovementMargin * 100).toFixed(0)}% concurrency=${config.routing.maxConcurrency} maxTasks=${config.routing.maxTasks} passthroughFailure≤${(config.routing.passthroughFailureLimit * 100).toFixed(0)}%`,
-          `Exploration: Lyapunov weight=${config.routing.explorationWeight} minSamples=${config.routing.explorationMinSamples} spent=$${exploration.spentUsd.toFixed(5)}/$${config.routing.explorationBudgetUsd.toFixed(2)} selections=${exploration.selections}`,
+          `Exploration: 样本缺口探索 weight=${config.routing.explorationWeight} minSamples=${config.routing.explorationMinSamples} spent=$${exploration.spentUsd.toFixed(5)}/$${config.routing.explorationBudgetUsd.toFixed(2)} selections=${exploration.selections}`,
+          `Budget: ${budget.snapshot().map((row) => `${row.scope} $${row.spentUsd.toFixed(3)}/$${row.limitUsd.toFixed(2)} λ×${row.lambdaMultiplier.toFixed(2)} debt=$${row.debtUsd.toFixed(3)}`).join("; ") || "未配置预算窗口"}`,
+          `Calibration: ${(() => { const c = ledger.getCalibration(); return c.pairs ? `pairs=${c.pairs} brier=${c.brierFailure.toFixed(3)} costBias=${c.costBiasRatio.toFixed(2)}` : "暂无已验收样本"; })()}`,
         ].join("\n");
         ctx.ui.notify(text, "info");
       },
@@ -971,6 +1086,7 @@ export function createHengFlowExtension(config: HengFlowConfig) {
     });
 
     pi.on("agent_settled", (_event, ctx) => {
+      budget.advanceTracked();
       if (currentBoard) {
         if (lastManagerStopReason !== "error" && lastManagerStopReason !== "aborted") {
           currentBoard = completeVerifiedWorkerTasks(currentBoard);

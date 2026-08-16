@@ -28,6 +28,20 @@ export interface HengFlowConfig {
   usage: {
     cacheTtlMs: number;
   };
+  budget: {
+    /** Session-scoped hard cap in USD; 0 disables session budgeting. */
+    sessionUsdLimit: number;
+    /** Optional per-provider rolling-day caps in USD, e.g. { "deepseek": 5 }. */
+    providerLimitsUsd: Record<string, number>;
+    /** Lambda sensitivity: multiplier reaches 1+kappa when debt hits 10% of the window limit. */
+    lambdaKappa: number;
+    /** When true, routing hard-rejects options that cannot fit the remaining window budget. */
+    hardFeasibility: boolean;
+    /** Defer non-critical Worker launches while lambda exceeds this multiplier; 0 disables. */
+    admissionLambdaThreshold: number;
+    /** Bounded single deferral window for admission control. */
+    admissionMaxWaitMs: number;
+  };
 }
 
 export const DEFAULT_CONFIG: HengFlowConfig = {
@@ -88,6 +102,14 @@ export const DEFAULT_CONFIG: HengFlowConfig = {
   usage: {
     cacheTtlMs: 5 * 60 * 1000,
   },
+  budget: {
+    sessionUsdLimit: 0,
+    providerLimitsUsd: {},
+    lambdaKappa: 2,
+    hardFeasibility: true,
+    admissionLambdaThreshold: 2.5,
+    admissionMaxWaitMs: 30_000,
+  },
 };
 
 function mergeConfig(base: HengFlowConfig, value: Partial<HengFlowConfig>): HengFlowConfig {
@@ -107,6 +129,7 @@ function mergeConfig(base: HengFlowConfig, value: Partial<HengFlowConfig>): Heng
     workers,
     routing: { ...base.routing, ...(value.routing ?? {}) },
     usage: { ...base.usage, ...(value.usage ?? {}) },
+    budget: { ...base.budget, ...(value.budget ?? {}) },
   };
 }
 

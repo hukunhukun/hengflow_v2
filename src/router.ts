@@ -1,4 +1,5 @@
 import type { HengFlowConfig } from "./config.js";
+import type { BudgetController } from "./budget-controller.js";
 import { estimateCost } from "./cost.js";
 import type { UsageLedger } from "./ledger.js";
 import type {
@@ -93,6 +94,7 @@ export function routeTask(
   ledger: UsageLedger,
   availableWorkers: Set<WorkerId> | readonly ModelRef[],
   exploration?: ExplorationState,
+  budget?: BudgetController,
 ): RouteDecision {
   const candidates = availableModels(config, availableWorkers);
   if (candidates.length === 0) throw new Error("没有已认证且可用的 Worker 模型；请先登录任意受支持的模型提供方");
@@ -102,7 +104,18 @@ export function routeTask(
     exploration && task.risk === "low" && !task.requiresWrite && !preferred
       && exploration.spentUsd < config.routing.explorationBudgetUsd,
   );
-  const scored = candidates.map((model) => {
+  // Hard-feasibility pre-filter: drop candidates whose provider window cannot
+  // fit this call, as long as at least one feasible candidate remains. When
+  // every candidate is infeasible, keep them all so routePlannedTask can
+  // degrade the whole delegation to the Manager.
+  let scoredCandidates = candidates;
+  if (budget && config.budget.hardFeasibility) {
+    const feasible = candidates.filter((model) =>
+      budget.checkFeasibility(estimateCost(model, task.estimatedInputTokens, task.estimatedOutputTokens)
+        * ledger.getLearnedProfile(task, model, 0.1).costRatio, budget.scopesFor(model)).feasible);
+    if (feasible.length > 0) scoredCandidates = feasible;
+  }
+  const scored = scoredCandidates.map((model) => {
     const id = model.id as WorkerId;
     const staticPredictedCostUsd = estimateCost(model, task.estimatedInputTokens, task.estimatedOutputTokens);
     const staticFail = baseFailure(model, task);
@@ -111,6 +124,9 @@ export function routeTask(
     const predictedCostUsd = staticPredictedCostUsd * learned.costRatio;
     const failure = learned.failureProbability;
     const quotaPressure = ledger.getQuotaPressure(model.provider);
+    // Shadow price: over-pace budget windows make this candidate's dollars
+    // proportionally more expensive instead of a fixed costWeight.
+    const lambdaMultiplier = budget ? budget.multiplierForModel(model) : 1;
     const latencyPenalty = learned.samples > 0
       ? Math.min(2, learned.latencyMs / 60_000)
       : task.estimatedInputTokens / 1_000_000;
@@ -134,7 +150,7 @@ export function routeTask(
       : 0;
     const exploitationScore =
       config.routing.qualityWeight * qualityLoss +
-      config.routing.costWeight * predictedCostUsd +
+      config.routing.costWeight * lambdaMultiplier * predictedCostUsd +
       config.routing.failureWeight * failure +
       config.routing.quotaWeight * quotaPressure +
       config.routing.latencyWeight * latencyPenalty +
@@ -164,9 +180,13 @@ export function routeTask(
   } else {
     explanation.push("尚无同类验收样本，使用冷启动先验");
   }
+  if (budget) {
+    const lambda = budget.multiplierForModel(selected.model);
+    if (lambda > 1.01) explanation.push(`预算影子价格×${lambda.toFixed(2)}（超速窗口内美元变贵）`);
+  }
   if (explored) {
     explanation.push(
-      `有限探索=on，Lyapunov势能缺口=${selected.potential}，预算累计=$${exploration!.spentUsd.toFixed(5)}`,
+      `有限探索=on，样本缺口=${selected.potential}，预算累计=$${exploration!.spentUsd.toFixed(5)}`,
     );
   }
   if (preferred) explanation.push(`Manager 指定偏好=${preferred}`);
@@ -199,6 +219,7 @@ export function routePlannedTask(
   availableWorkers: Set<WorkerId> | readonly ModelRef[],
   options: PlanRoutingOptions = { returnPolicy: "manager_synthesis" },
   exploration?: ExplorationState,
+  budget?: BudgetController,
 ): PlanRouteDecision {
   const directExecutionCostUsd = estimateCost(
     config.manager,
@@ -223,7 +244,7 @@ export function routePlannedTask(
   if (task.kind === "synthesis") return manager("最终综合与责任判断由 Manager 保留");
   if (availableModels(config, availableWorkers).length === 0) return manager("没有已认证 Worker，回退 Manager");
 
-  const workerRoute = routeTask(task, config, ledger, availableWorkers, exploration);
+  const workerRoute = routeTask(task, config, ledger, availableWorkers, exploration, budget);
   const verificationInput = Math.min(1_600, Math.max(250, task.estimatedOutputTokens));
   const verificationOutput = Math.min(350, Math.max(120, task.estimatedOutputTokens * 0.2));
   const verificationCost = options.returnPolicy === "manager_synthesis"
@@ -245,6 +266,12 @@ export function routePlannedTask(
     return manager(
       `委派预计改善 ${(improvement * 100).toFixed(1)}%，低于 ${(config.routing.splitImprovementMargin * 100).toFixed(0)}% 门槛`,
     );
+  }
+  if (budget) {
+    const feasibility = budget.checkFeasibility(delegatedCostUsd, budget.scopesFor(workerRoute.selected));
+    if (!feasibility.feasible) {
+      return manager(`预算不可行（${feasibility.reason}）；已降级为 Manager 直接执行`);
+    }
   }
 
   return {

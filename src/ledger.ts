@@ -27,6 +27,41 @@ export interface ModelStats {
   averageShadowCostUsd: number;
 }
 
+/** Persisted pacing state for one budget window. Spend itself is always derived
+ * from model_calls; only non-derivable accumulators (debt, lambda) persist. */
+export interface BudgetWindowState {
+  scope: string;
+  limitUsd: number;
+  windowStart: number;
+  resetAt: number;
+  debtUsd: number;
+  lambdaMultiplier: number;
+  lastAdvancedAt: number;
+  lastSpentUsd: number;
+}
+
+export interface QuotaState {
+  pressure: number;
+  timeToResetMs?: number;
+}
+
+export interface CalibrationRow {
+  provider: string;
+  model: string;
+  pairs: number;
+  brierFailure: number;
+  meanPredictedCostUsd: number;
+  meanActualCostUsd: number;
+  costBiasRatio: number;
+}
+
+export interface CalibrationReport {
+  pairs: number;
+  brierFailure: number;
+  costBiasRatio: number;
+  byModel: CalibrationRow[];
+}
+
 export interface LearnedStat {
   provider: string;
   model: string;
@@ -102,7 +137,19 @@ export class UsageLedger {
         score REAL NOT NULL,
         predicted_cost_usd REAL NOT NULL,
         predicted_failure REAL NOT NULL,
+        phase TEXT NOT NULL DEFAULT 'plan',
         explanation_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS budget_windows (
+        scope TEXT PRIMARY KEY,
+        limit_usd REAL NOT NULL,
+        window_start INTEGER NOT NULL,
+        reset_at INTEGER NOT NULL,
+        debt_usd REAL NOT NULL DEFAULT 0,
+        lambda_multiplier REAL NOT NULL DEFAULT 1,
+        last_advanced_at INTEGER NOT NULL,
+        last_spent_usd REAL NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS quota_snapshots (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -144,9 +191,16 @@ export class UsageLedger {
         PRIMARY KEY(provider, model, task_kind, complexity_bucket)
       );
       CREATE INDEX IF NOT EXISTS idx_calls_model ON model_calls(provider, model, created_at);
+      CREATE INDEX IF NOT EXISTS idx_calls_created ON model_calls(created_at);
       CREATE INDEX IF NOT EXISTS idx_quota_provider ON quota_snapshots(provider, fetched_at);
       CREATE INDEX IF NOT EXISTS idx_outcomes_model ON task_outcomes(provider, model, task_kind, complexity_bucket);
     `);
+    // Databases created before v3 lack the phase column on route_decisions.
+    try {
+      this.db.exec("ALTER TABLE route_decisions ADD COLUMN phase TEXT NOT NULL DEFAULT 'plan'");
+    } catch {
+      // column already exists
+    }
   }
 
   recordManagerCall(
@@ -227,15 +281,15 @@ export class UsageLedger {
       );
   }
 
-  recordDecision(decision: RouteDecision): void {
+  recordDecision(decision: RouteDecision, phase: "plan" | "launch" = "plan"): void {
     this.db.prepare(`INSERT INTO route_decisions (
       created_at, task_id, selected_provider, selected_model, fallback_provider,
-      fallback_model, score, predicted_cost_usd, predicted_failure, explanation_json
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      fallback_model, score, predicted_cost_usd, predicted_failure, phase, explanation_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(
         Date.now(), decision.taskId, decision.selected.provider, decision.selected.model,
         decision.fallback?.provider ?? null, decision.fallback?.model ?? null,
-        decision.score, decision.predictedCostUsd, decision.predictedFailureProbability,
+        decision.score, decision.predictedCostUsd, decision.predictedFailureProbability, phase,
         JSON.stringify(decision.explanation),
       );
   }
@@ -377,15 +431,117 @@ export class UsageLedger {
   }
 
   getQuotaPressure(provider: string): number {
+    return this.getQuotaState(provider).pressure;
+  }
+
+  /** Quota pressure plus reset horizon, so "50% left, resets in 1h" and
+   * "50% left, resets in 29d" become distinct routing states. */
+  getQuotaState(provider: string, now = Date.now()): QuotaState {
     const report = this.getLatestQuota(provider);
-    if (!report || report.limits.length === 0) return 0;
+    if (!report || report.limits.length === 0) return { pressure: 0 };
     const pressures = report.limits.map((limit) => {
       if (limit.unit === "percent" && limit.used !== undefined) return Math.min(1, Math.max(0, limit.used / 100));
       if (limit.limit && limit.used !== undefined) return Math.min(1, Math.max(0, limit.used / limit.limit));
       if (limit.limit && limit.remaining !== undefined) return Math.min(1, Math.max(0, 1 - limit.remaining / limit.limit));
       return 0;
     });
-    return Math.max(...pressures, 0);
+    const resetAt = Math.max(0, ...report.limits.map((limit) => limit.resetAt ?? 0));
+    const timeToResetMs = resetAt > now ? resetAt - now : undefined;
+    return { pressure: Math.max(...pressures, 0), timeToResetMs };
+  }
+
+  /** Derived window spend from model_calls; single source of truth for budgeting. */
+  getSpendSince(sinceTs: number, provider?: string): number {
+    const row = provider
+      ? this.db.prepare("SELECT COALESCE(SUM(shadow_cost_usd), 0) AS spend FROM model_calls WHERE created_at >= ? AND provider = ?")
+          .get(sinceTs, provider) as Record<string, number>
+      : this.db.prepare("SELECT COALESCE(SUM(shadow_cost_usd), 0) AS spend FROM model_calls WHERE created_at >= ?")
+          .get(sinceTs) as Record<string, number>;
+    return Number(row.spend);
+  }
+
+  getBudgetWindow(scope: string): BudgetWindowState | undefined {
+    const row = this.db.prepare(
+      "SELECT scope, limit_usd, window_start, reset_at, debt_usd, lambda_multiplier, last_advanced_at, last_spent_usd FROM budget_windows WHERE scope = ?",
+    ).get(scope) as Record<string, string | number> | undefined;
+    if (!row) return undefined;
+    return {
+      scope: String(row.scope),
+      limitUsd: Number(row.limit_usd),
+      windowStart: Number(row.window_start),
+      resetAt: Number(row.reset_at),
+      debtUsd: Number(row.debt_usd),
+      lambdaMultiplier: Number(row.lambda_multiplier),
+      lastAdvancedAt: Number(row.last_advanced_at),
+      lastSpentUsd: Number(row.last_spent_usd),
+    };
+  }
+
+  upsertBudgetWindow(state: BudgetWindowState): void {
+    this.db.prepare(`INSERT INTO budget_windows (
+      scope, limit_usd, window_start, reset_at, debt_usd, lambda_multiplier, last_advanced_at, last_spent_usd, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(scope) DO UPDATE SET
+      limit_usd = excluded.limit_usd, window_start = excluded.window_start, reset_at = excluded.reset_at,
+      debt_usd = excluded.debt_usd, lambda_multiplier = excluded.lambda_multiplier,
+      last_advanced_at = excluded.last_advanced_at, last_spent_usd = excluded.last_spent_usd,
+      updated_at = excluded.updated_at`)
+      .run(
+        state.scope, state.limitUsd, state.windowStart, state.resetAt, state.debtUsd,
+        state.lambdaMultiplier, state.lastAdvancedAt, state.lastSpentUsd, Date.now(),
+      );
+  }
+
+  /** Compare predicted failure/cost against realized outcomes to expose router miscalibration. */
+  getCalibration(sinceTs = 0): CalibrationReport {
+    const rows = this.db.prepare(`SELECT o.provider, o.model, o.status, o.shadow_cost_usd AS actual_cost,
+      (SELECT d.predicted_failure FROM route_decisions d
+        WHERE d.task_id = o.task_id AND d.selected_provider = o.provider AND d.selected_model = o.model
+          AND d.created_at <= o.created_at ORDER BY d.created_at DESC LIMIT 1) AS predicted_failure,
+      (SELECT d.predicted_cost_usd FROM route_decisions d
+        WHERE d.task_id = o.task_id AND d.selected_provider = o.provider AND d.selected_model = o.model
+          AND d.created_at <= o.created_at ORDER BY d.created_at DESC LIMIT 1) AS predicted_cost
+      FROM task_outcomes o WHERE o.created_at >= ?`).all(sinceTs) as Array<Record<string, string | number | null>>;
+    const byModel = new Map<string, { provider: string; model: string; pairs: number; brierSum: number; predictedSum: number; actualSum: number }>();
+    let pairs = 0;
+    let brierSum = 0;
+    let predictedSum = 0;
+    let actualSum = 0;
+    for (const row of rows) {
+      if (row.predicted_failure === null || row.predicted_cost === null) continue;
+      const provider = String(row.provider);
+      const model = String(row.model);
+      const key = `${provider}/${model}`;
+      const outcomeFailed = row.status === "accepted" || row.status === "accepted_edit" ? 0 : 1;
+      const predictedFailure = Number(row.predicted_failure);
+      const actualCost = Number(row.actual_cost);
+      const predictedCost = Math.max(Number(row.predicted_cost), 1e-9);
+      const brier = (predictedFailure - outcomeFailed) ** 2;
+      pairs += 1;
+      brierSum += brier;
+      predictedSum += predictedCost;
+      actualSum += actualCost;
+      const bucket = byModel.get(key) ?? { provider, model, pairs: 0, brierSum: 0, predictedSum: 0, actualSum: 0 };
+      bucket.pairs += 1;
+      bucket.brierSum += brier;
+      bucket.predictedSum += predictedCost;
+      bucket.actualSum += actualCost;
+      byModel.set(key, bucket);
+    }
+    return {
+      pairs,
+      brierFailure: pairs ? brierSum / pairs : 0,
+      costBiasRatio: predictedSum ? actualSum / predictedSum : 1,
+      byModel: [...byModel.values()].map((bucket) => ({
+        provider: bucket.provider,
+        model: bucket.model,
+        pairs: bucket.pairs,
+        brierFailure: bucket.pairs ? bucket.brierSum / bucket.pairs : 0,
+        meanPredictedCostUsd: bucket.pairs ? bucket.predictedSum / bucket.pairs : 0,
+        meanActualCostUsd: bucket.pairs ? bucket.actualSum / bucket.pairs : 0,
+        costBiasRatio: bucket.predictedSum ? bucket.actualSum / bucket.predictedSum : 1,
+      })).sort((left, right) => right.pairs - left.pairs),
+    };
   }
 
   getModelStats(): ModelStats[] {

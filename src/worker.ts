@@ -65,6 +65,23 @@ You are a read-only subagent working for a Manager. The inherited conversation i
 Execute only the newest delegated task. Never edit or write files, publish, deploy, delete data, handle credentials, or perform external writes.
 Inspect evidence before concluding. Return compact findings that distinguish facts, inferences, and unresolved questions.`;
 
+// ModelRuntime construction re-reads auth/models for every Worker; under lazy
+// re-routing launch frequency rises, so share one instance per agent dir.
+const modelRuntimeCache = new Map<string, { runtime: ModelRuntime; loadedAt: number }>();
+const MODEL_RUNTIME_TTL_MS = 60_000;
+
+async function getSharedModelRuntime(agentDir: string): Promise<ModelRuntime> {
+  const cached = modelRuntimeCache.get(agentDir);
+  if (cached && Date.now() - cached.loadedAt < MODEL_RUNTIME_TTL_MS) return cached.runtime;
+  const runtime = await ModelRuntime.create({
+    authPath: join(agentDir, "auth.json"),
+    modelsPath: join(agentDir, "models.json"),
+    allowModelNetwork: false,
+  });
+  modelRuntimeCache.set(agentDir, { runtime, loadedAt: Date.now() });
+  return runtime;
+}
+
 function trimIncompleteTail(messages: ContextMessage[]): ContextMessage[] {
   let lastAssistant = -1;
   for (let index = messages.length - 1; index >= 0; index--) {
@@ -136,11 +153,7 @@ export function createForkedSessionManager(context: ParentContextSnapshot, cwd: 
 
 const defaultSessionFactory: WorkerSessionFactory = async ({ selected, cwd, tools, context }) => {
   const agentDir = getAgentDir();
-  const modelRuntime = await ModelRuntime.create({
-    authPath: join(agentDir, "auth.json"),
-    modelsPath: join(agentDir, "models.json"),
-    allowModelNetwork: false,
-  });
+  const modelRuntime = await getSharedModelRuntime(agentDir);
   const model = modelRuntime.getModel(selected.provider, selected.model);
   if (!model) throw new Error(`Worker 模型不存在：${selected.provider}/${selected.model}`);
   const settingsManager = SettingsManager.create(cwd, agentDir);
