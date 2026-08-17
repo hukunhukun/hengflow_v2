@@ -57,6 +57,9 @@ function removeManagerOverrides(args: string[]): string[] {
 async function run(): Promise<void> {
   process.title = "hengflow-v2";
   process.env.HENGFLOW_V2 = "1";
+  // HengFlow pins its embedded pi engine exactly; upstream release notices are
+  // noise for end users and engine upgrades are deliberate dependency bumps.
+  process.env.PI_SKIP_VERSION_CHECK = "1";
   const args = process.argv.slice(2);
   if (args[0] === "help" || args[0] === "--help" || args[0] === "-h") {
     console.log(help());
