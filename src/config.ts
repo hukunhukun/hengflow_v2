@@ -1,12 +1,30 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import type { ModelRef } from "./types.js";
+import type { ModelRef, TaskKind } from "./types.js";
+
+/** Benchmark-run overrides consumed by the extension for variant behavior. */
+export interface BenchRunConfig {
+  variant: "single" | "fixed_mapping" | "learned" | "learned_frozen";
+  /** `provider/model` for the single variant. */
+  singleModel?: string;
+  /** kind → worker id (`provider/model`) for fixed_mapping. */
+  fixedMapping?: Partial<Record<TaskKind, string>>;
+  /** Skip all learning writes (learned_frozen). */
+  freezeLearning?: boolean;
+  /** Fixed RNG seed base for reproducible routing. */
+  seed?: number;
+  benchId?: string;
+  taskId?: string;
+}
 
 export interface HengFlowConfig {
   modelsConfigured: boolean;
+  /** v4 canonical: learned-manager pool; first entry is the anchor. */
+  pool: ModelRef[];
+  /** Derived from pool[0] for backward compatibility. */
   manager: ModelRef;
-  /** Explicitly selected Worker models keyed by alias or `provider/model`. */
+  /** Derived: pool minus the anchor, keyed by `provider/model`. */
   workers: Record<string, ModelRef>;
   routing: {
     maxConcurrency: number;
@@ -24,7 +42,11 @@ export interface HengFlowConfig {
     explorationWeight: number;
     explorationMinSamples: number;
     explorationBudgetUsd: number;
+    /** Benchmark fixed-mapping policy; absent in normal operation. */
+    forcedWorkerByKind?: Partial<Record<TaskKind, string>>;
   };
+  /** Present only during benchmark runs. */
+  bench?: BenchRunConfig;
   usage: {
     cacheTtlMs: number;
   };
@@ -44,44 +66,53 @@ export interface HengFlowConfig {
   };
 }
 
+const DEFAULT_MANAGER: ModelRef = {
+  id: "manager",
+  provider: "openai-codex",
+  model: "gpt-5.6-sol",
+  thinking: "medium",
+  quality: 0.96,
+  inputUsdPerMillion: 5,
+  cachedInputUsdPerMillion: 0.5,
+  outputUsdPerMillion: 30,
+};
+
+const DEFAULT_WORKERS: Record<string, ModelRef> = {
+  deepseek: {
+    id: "deepseek",
+    provider: "deepseek",
+    model: "deepseek-v4-flash",
+    thinking: "max",
+    quality: 0.79,
+    inputUsdPerMillion: 0.14,
+    cachedInputUsdPerMillion: 0.0028,
+    outputUsdPerMillion: 0.28,
+    contextWindow: 128_000,
+    affinity: ["simple"],
+  },
+  glm: {
+    id: "glm",
+    provider: "zai-coding-cn",
+    model: "glm-5.2",
+    thinking: "max",
+    quality: 0.87,
+    inputUsdPerMillion: 1.4,
+    cachedInputUsdPerMillion: 0.26,
+    outputUsdPerMillion: 4.4,
+    contextWindow: 200_000,
+    affinity: ["research", "coding", "long-context"],
+  },
+};
+
+function canonicalPoolId(model: ModelRef): string {
+  return model.id && model.id !== "manager" ? model.id : `${model.provider}/${model.model}`;
+}
+
 export const DEFAULT_CONFIG: HengFlowConfig = {
   modelsConfigured: false,
-  manager: {
-    id: "manager",
-    provider: "openai-codex",
-    model: "gpt-5.6-sol",
-    thinking: "medium",
-    quality: 0.96,
-    inputUsdPerMillion: 5,
-    cachedInputUsdPerMillion: 0.5,
-    outputUsdPerMillion: 30,
-  },
-  workers: {
-    deepseek: {
-      id: "deepseek",
-      provider: "deepseek",
-      model: "deepseek-v4-flash",
-      thinking: "max",
-      quality: 0.79,
-      inputUsdPerMillion: 0.14,
-      cachedInputUsdPerMillion: 0.0028,
-      outputUsdPerMillion: 0.28,
-      contextWindow: 128_000,
-      affinity: ["simple"],
-    },
-    glm: {
-      id: "glm",
-      provider: "zai-coding-cn",
-      model: "glm-5.2",
-      thinking: "max",
-      quality: 0.87,
-      inputUsdPerMillion: 1.4,
-      cachedInputUsdPerMillion: 0.26,
-      outputUsdPerMillion: 4.4,
-      contextWindow: 200_000,
-      affinity: ["research", "coding", "long-context"],
-    },
-  },
+  pool: [DEFAULT_MANAGER, ...Object.values(DEFAULT_WORKERS).map((worker) => ({ ...worker, id: canonicalPoolId(worker) }))],
+  manager: DEFAULT_MANAGER,
+  workers: { ...DEFAULT_WORKERS },
   routing: {
     maxConcurrency: 3,
     splitImprovementMargin: 0.15,
@@ -112,24 +143,45 @@ export const DEFAULT_CONFIG: HengFlowConfig = {
   },
 };
 
-function mergeConfig(base: HengFlowConfig, value: Partial<HengFlowConfig>): HengFlowConfig {
-  const workers: Record<string, ModelRef> = value.modelsConfigured && value.workers
-    ? Object.fromEntries(Object.entries(value.workers).map(([id, worker]) => [id, { ...worker, id }]))
-    : { ...base.workers };
-  if (!value.modelsConfigured) {
-    for (const [id, worker] of Object.entries(value.workers ?? {})) {
-      const previous = workers[id];
-      workers[id] = previous ? { ...previous, ...worker, id } : { ...worker, id };
-    }
+/** Fold legacy manager/workers and v4 pool entries into one deduped pool. */
+function normalizePool(base: ModelRef[], value: Partial<HengFlowConfig>): ModelRef[] {
+  const source = value.pool && value.pool.length
+    ? value.pool
+    : value.manager || value.workers
+      ? [value.manager ?? base[0], ...Object.values(value.workers ?? {})]
+      : base;
+  const seen = new Set<string>();
+  const pool: ModelRef[] = [];
+  for (const entry of source) {
+    if (!entry?.provider || !entry.model) continue;
+    const key = `${entry.provider}/${entry.model}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    pool.push({ ...entry, id: canonicalPoolId(entry) });
   }
+  return pool;
+}
+
+function mergeConfig(base: HengFlowConfig, value: Partial<HengFlowConfig>): HengFlowConfig {
+  const pool = normalizePool(base.pool, value);
+  let manager = pool[0] ?? base.manager;
+  // Bench single variant: the measured model serves as the launch manager.
+  const singleId = value.bench?.variant === "single" ? value.bench.singleModel : undefined;
+  if (singleId) {
+    const single = pool.find((model) => `${model.provider}/${model.model}` === singleId);
+    if (single) manager = single;
+  }
+  const workers = Object.fromEntries(pool.slice(1).map((model) => [model.id, model]));
   return {
     ...base,
     ...value,
-    manager: { ...base.manager, ...(value.manager ?? {}) },
+    manager,
     workers,
+    pool,
     routing: { ...base.routing, ...(value.routing ?? {}) },
     usage: { ...base.usage, ...(value.usage ?? {}) },
     budget: { ...base.budget, ...(value.budget ?? {}) },
+    bench: value.bench ?? base.bench,
   };
 }
 
@@ -151,6 +203,38 @@ export function loadConfig(cwd = process.cwd()): HengFlowConfig {
     config = mergeConfig(config, parsed);
   }
   return config;
+}
+
+/** Persist the v4 learned-manager pool (first entry = anchor). Requires >= 2 distinct models. */
+export function savePoolSelection(pool: ModelRef[], agentDir = getAgentDir()): string {
+  if (pool.length < 2) {
+    throw new Error("HengFlow v4 需要至少 2 个模型组成池（首位为锚点）");
+  }
+  const seen = new Set<string>();
+  const normalized = pool.map((entry) => {
+    if (!entry?.provider || !entry.model) throw new Error("池中存在不完整的模型条目");
+    const key = `${entry.provider}/${entry.model}`;
+    if (seen.has(key)) throw new Error(`池中存在重复模型 ${key}`);
+    seen.add(key);
+    if (
+      !(entry.inputUsdPerMillion >= 0) || !(entry.outputUsdPerMillion >= 0)
+      || !(entry.cachedInputUsdPerMillion >= 0)
+    ) {
+      throw new Error(`${key} 缺少有效价格（每百万 Token 美元）`);
+    }
+    return { ...entry, id: canonicalPoolId(entry) };
+  });
+  mkdirSync(agentDir, { recursive: true });
+  const path = join(agentDir, "config.json");
+  const existing = existsSync(path)
+    ? JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>
+    : {};
+  const next = { ...existing, modelsConfigured: true, pool: normalized };
+  const temp = `${path}.hengflow-tmp`;
+  writeFileSync(temp, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
+  renameSync(temp, path);
+  chmodSync(path, 0o600);
+  return path;
 }
 
 export function saveModelSelection(

@@ -4,6 +4,8 @@ import { main, ModelRuntime } from "./runtime/agent.js";
 import { authStatus, importApiKeys } from "./auth.js";
 import { getAgentDir, loadConfig } from "./config.js";
 import { configureNetworkProxy } from "./network.js";
+import type { BenchPriceTable, BenchVariant } from "./bench/schema.js";
+import { priceKey } from "./bench/schema.js";
 
 const VERSION = "0.7.1";
 
@@ -54,6 +56,122 @@ function removeManagerOverrides(args: string[]): string[] {
   return output;
 }
 
+async function runBenchCommand(args: string[]): Promise<void> {
+  const sub = args[1];
+  if (sub !== "run" && sub !== "report") {
+    console.log(`用法：
+  hengflow-v2 bench run --bench mbpp [--data path.jsonl] [--limit 5] [--variants learned,single:<provider/model>,fixed_mapping,learned_frozen] [--repeats 1] [--out bench/runs] [--ledger isolated|session|frozen] [--frozen-ledger path] [--seed 1] [--timeout 600000]
+  hengflow-v2 bench report --dir bench/runs`);
+    return;
+  }
+  const flag = (name: string, fallback = ""): string => {
+    const index = args.indexOf(`--${name}`);
+    return index >= 0 && args[index + 1] ? args[index + 1] : fallback;
+  };
+  const config = loadConfig();
+  if (sub === "report") {
+    const { loadExistingRecords } = await import("./bench/runner.js");
+    const { summarizeBenchRuns, wilsonInterval } = await import("./bench/schema.js");
+    const records = loadExistingRecords(flag("dir", "bench/runs"));
+    if (records.length === 0) {
+      console.log("没有可汇总的 result.json；先运行 bench run。");
+      return;
+    }
+    const summary = summarizeBenchRuns(records);
+    console.log("\nvariant                     runs  resolved  rate    [wilson 95%]     meanCost   cost/resolved  success/$");
+    for (const row of summary) {
+      const interval = wilsonInterval(row.resolvedRuns, row.runs);
+      console.log(
+        `${row.variant.padEnd(26)} ${String(row.runs).padStart(4)}  ${String(row.resolvedRuns).padStart(8)}  ${row.resolvedRate.toFixed(2)}  [${interval.low.toFixed(2)}, ${interval.high.toFixed(2)}]  $${row.meanCostUsd.toFixed(4).padStart(9)}  $${(Number.isFinite(row.costPerResolvedUsd) ? row.costPerResolvedUsd.toFixed(4) : "∞").padStart(11)}  ${row.successesPerDollar.toFixed(2).padStart(9)}`,
+      );
+    }
+    const unpriced = new Set<string>();
+    const config = loadConfig();
+    const table: BenchPriceTable = {};
+    for (const model of config.pool) {
+      table[priceKey(model.provider, model.model)] = {
+        inputUsdPerMillion: model.inputUsdPerMillion,
+        cacheReadUsdPerMillion: model.cachedInputUsdPerMillion,
+        outputUsdPerMillion: model.outputUsdPerMillion,
+      };
+    }
+    for (const record of records) {
+      for (const call of record.calls) {
+        if (!table[priceKey(call.provider, call.model)]) unpriced.add(priceKey(call.provider, call.model));
+      }
+    }
+    if (unpriced.size > 0) {
+      console.log(`\n⚠ 以下模型不在价格表中，其成本被记为 $0（结果被低估）：${[...unpriced].join(", ")}`);
+      console.log("  请在 /models 中为它们配置每百万 Token 价格后重跑，或检查网关是否回报了别名模型名。");
+    }
+    return;
+  }
+
+  // bench run
+  const benchId = flag("bench", "mbpp") as "mbpp" | "humanevalplus" | "mbppplus";
+  if (!(["mbpp", "humanevalplus", "mbppplus"].includes(benchId))) throw new Error(`未知 bench：${benchId}`);
+  const variantsRaw = (flag("variants", "learned") ?? "").split(",").map((v) => v.trim()).filter(Boolean);
+  if (variantsRaw.length === 0) throw new Error("--variants 不能为空");
+  const { pythonAvailable } = await import("./bench/mbpp.js");
+  const pythonBin = flag("python", "python3");
+  if (!pythonAvailable(pythonBin)) throw new Error(`未找到 ${pythonBin}；MBPP 判定需要本地 Python（≥3.9）`);
+  if (!config.modelsConfigured || config.pool.length < 2) {
+    throw new Error("请先在 TUI 中执行 /models 配置 ≥2 个模型（含价格），再运行 bench");
+  }
+  const pool = config.pool;
+  const variants = variantsRaw.map((raw): BenchVariant => {
+    if (raw.startsWith("single:")) {
+      const model = raw.slice("single:".length);
+      if (!pool.some((entry) => `${entry.provider}/${entry.model}` === model)) {
+        throw new Error(`single 变体模型不在池中：${model}`);
+      }
+      return { kind: "single", model };
+    }
+    if (raw === "learned" || raw === "learned_frozen" || raw === "fixed_mapping") return { kind: raw };
+    throw new Error(`未知变体：${raw}`);
+  });
+  const ledgerMode = (flag("ledger", "isolated") ?? "isolated") as "isolated" | "session" | "frozen";
+  if (ledgerMode === "frozen" && !flag("frozen-ledger")) {
+    throw new Error("--ledger frozen 需要 --frozen-ledger <usage.sqlite>（训练期账本快照）");
+  }
+  // fixed_mapping 默认：便宜模型接 simple/research，强模型接 coding/long-context
+  const cheapest = [...pool].sort(
+    (left, right) => (left.inputUsdPerMillion + left.outputUsdPerMillion)
+      - (right.inputUsdPerMillion + right.outputUsdPerMillion),
+  )[0];
+  const strongest = [...pool].sort((left, right) => right.quality - left.quality)[0];
+  const id = (model: typeof cheapest) => `${model.provider}/${model.model}`;
+
+  const { runBench } = await import("./bench/runner.js");
+  const records = await runBench({
+    benchId,
+    dataPath: flag("data") || undefined,
+    limit: Number(flag("limit", "5")),
+    offset: Number(flag("offset", "0")),
+    variants,
+    repeats: Number(flag("repeats", "1")),
+    outRoot: flag("out", "bench/runs"),
+    ledgerMode,
+    frozenLedgerPath: flag("frozen-ledger") || undefined,
+    userPool: pool,
+    seedBase: Number(flag("seed", "1")),
+    runTimeoutMs: Number(flag("timeout", String(10 * 60 * 1000))),
+    pythonBin,
+    fixedMapping: {
+      simple: id(cheapest), research: id(cheapest),
+      coding: id(strongest), "long-context": id(strongest),
+    },
+  });
+  const { summarizeBenchRuns } = await import("./bench/schema.js");
+  const summary = summarizeBenchRuns(records);
+  console.log("\n完成。汇总：");
+  for (const row of summary) {
+    console.log(
+      `${row.variant}: resolved ${row.resolvedRuns}/${row.runs}，meanCost=$${row.meanCostUsd.toFixed(4)}，cost/resolved=${Number.isFinite(row.costPerResolvedUsd) ? `$${row.costPerResolvedUsd.toFixed(4)}` : "∞"}`,
+    );
+  }
+}
+
 async function run(): Promise<void> {
   process.title = "hengflow-v2";
   process.env.HENGFLOW_V2 = "1";
@@ -79,6 +197,11 @@ async function run(): Promise<void> {
     console.log(await importApiKeys(resolve(args[fromIndex + 1])));
     return;
   }
+  await configureNetworkProxy();
+  if (args[0] === "bench") {
+    await runBenchCommand(args);
+    return;
+  }
   const config = loadConfig();
   if (args[0] === "dashboard") {
     const [{ UsageLedger }, { renderDashboard }] = await Promise.all([
@@ -93,7 +216,6 @@ async function run(): Promise<void> {
     }
     return;
   }
-  await configureNetworkProxy();
   if (args[0] === "usage") {
     const [{ UsageLedger }, { fetchAllUsage, formatUsageReports }] = await Promise.all([
       import("./ledger.js"),

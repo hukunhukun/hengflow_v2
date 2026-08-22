@@ -78,6 +78,26 @@ const PRIOR_STRENGTH = 10;
 const FAILURE_PRIOR_TOTAL = 5;
 const FAILURE_PRIOR_FAILURES = 1;
 const EWMA_ALPHA = 0.2;
+const LENIENCY_ALPHA = 0.1;
+
+export interface ManagerRoleProfile {
+  provider: string;
+  model: string;
+  samples: number;
+  successes: number;
+}
+
+export interface TurnOutcomeRecord {
+  turnId: string;
+  benchId: string;
+  taskId: string;
+  managerProvider: string;
+  managerModel: string;
+  finalStatus: "accepted" | "reworked" | "rejected" | "failed";
+  totalCostUsd: number;
+  durationMs: number;
+  reworkCount: number;
+}
 
 export function complexityBucket(complexity: number): string {
   if (complexity < 0.35) return "low";
@@ -190,6 +210,40 @@ export class UsageLedger {
         updated_at INTEGER NOT NULL,
         PRIMARY KEY(provider, model, task_kind, complexity_bucket)
       );
+      CREATE TABLE IF NOT EXISTS role_stats (
+        provider TEXT NOT NULL,
+        model TEXT NOT NULL,
+        role TEXT NOT NULL,
+        task_kind TEXT NOT NULL DEFAULT 'turn',
+        complexity_bucket TEXT NOT NULL DEFAULT 'any',
+        samples INTEGER NOT NULL,
+        reward_sum REAL NOT NULL,
+        successes INTEGER NOT NULL,
+        ewma_cost_ratio REAL NOT NULL DEFAULT 1,
+        ewma_latency_ms REAL NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY(provider, model, role, task_kind, complexity_bucket)
+      );
+      CREATE TABLE IF NOT EXISTS turn_outcomes (
+        turn_id TEXT PRIMARY KEY,
+        bench_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        manager_provider TEXT NOT NULL,
+        manager_model TEXT NOT NULL,
+        final_status TEXT NOT NULL,
+        total_cost_usd REAL NOT NULL,
+        duration_ms INTEGER NOT NULL,
+        rework_count INTEGER NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS verifier_calibration (
+        provider TEXT NOT NULL,
+        model TEXT NOT NULL,
+        leniency_ewma REAL NOT NULL DEFAULT 0,
+        pairs INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY(provider, model)
+      );
       CREATE INDEX IF NOT EXISTS idx_calls_model ON model_calls(provider, model, created_at);
       CREATE INDEX IF NOT EXISTS idx_calls_created ON model_calls(created_at);
       CREATE INDEX IF NOT EXISTS idx_quota_provider ON quota_snapshots(provider, fetched_at);
@@ -200,6 +254,15 @@ export class UsageLedger {
       this.db.exec("ALTER TABLE route_decisions ADD COLUMN phase TEXT NOT NULL DEFAULT 'plan'");
     } catch {
       // column already exists
+    }
+    // v4 bench ground-truth learning: task context on routing rows so the
+    // runner can attribute judge results to (model × kind × bucket) cells.
+    for (const column of ["task_kind TEXT", "complexity_bucket TEXT"]) {
+      try {
+        this.db.exec(`ALTER TABLE route_decisions ADD COLUMN ${column}`);
+      } catch {
+        // column already exists
+      }
     }
   }
 
@@ -281,16 +344,23 @@ export class UsageLedger {
       );
   }
 
-  recordDecision(decision: RouteDecision, phase: "plan" | "launch" = "plan"): void {
+  recordDecision(
+    decision: RouteDecision,
+    phase: "plan" | "launch" | "manager" = "plan",
+    task?: { kind: string; complexity: number },
+  ): void {
     this.db.prepare(`INSERT INTO route_decisions (
       created_at, task_id, selected_provider, selected_model, fallback_provider,
-      fallback_model, score, predicted_cost_usd, predicted_failure, phase, explanation_json
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      fallback_model, score, predicted_cost_usd, predicted_failure, phase, explanation_json,
+      task_kind, complexity_bucket
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(
         Date.now(), decision.taskId, decision.selected.provider, decision.selected.model,
         decision.fallback?.provider ?? null, decision.fallback?.model ?? null,
         decision.score, decision.predictedCostUsd, decision.predictedFailureProbability, phase,
         JSON.stringify(decision.explanation),
+        task?.kind ?? null,
+        task ? complexityBucket(task.complexity) : null,
       );
   }
 
@@ -299,13 +369,15 @@ export class UsageLedger {
     result: WorkerResult,
     outcome: TaskOutcome,
     model: ModelRef,
+    leniencyDiscount = 1,
   ): LearnedProfile {
     const task = result.task;
     const bucket = complexityBucket(task.complexity);
     const quality = Math.min(1, Math.max(0, outcome.quality));
     const confidence = Math.min(1, Math.max(0, outcome.confidence));
+    const discount = Math.min(1, Math.max(0.05, leniencyDiscount));
     const observedReward = 0.65 * outcomeBaseReward(outcome.status) + 0.35 * quality;
-    const reward = confidence * observedReward + (1 - confidence) * model.quality;
+    const reward = discount * (confidence * observedReward + (1 - confidence) * model.quality);
     const shadowCost = workerShadowCost(result);
     const predictedCost = Math.max(result.route.predictedCostUsd, 1e-9);
     const costRatio = Math.min(4, Math.max(0.25, shadowCost / predictedCost));
@@ -337,12 +409,97 @@ export class UsageLedger {
           model.provider, model.model, task.kind, bucket, reward, semanticSuccess,
           costRatio, result.durationMs, Date.now(),
         );
+      this.db.prepare(`INSERT INTO role_stats (
+        provider, model, role, task_kind, complexity_bucket, samples, reward_sum,
+        successes, ewma_cost_ratio, ewma_latency_ms, updated_at
+      ) VALUES (?, ?, 'worker', ?, ?, 1, ?, ?, ?, ?, ?)
+      ON CONFLICT(provider, model, role, task_kind, complexity_bucket) DO UPDATE SET
+        samples = samples + 1,
+        reward_sum = reward_sum + excluded.reward_sum,
+        successes = successes + excluded.successes,
+        ewma_cost_ratio = (1 - ${EWMA_ALPHA}) * ewma_cost_ratio + ${EWMA_ALPHA} * excluded.ewma_cost_ratio,
+        ewma_latency_ms = (1 - ${EWMA_ALPHA}) * ewma_latency_ms + ${EWMA_ALPHA} * excluded.ewma_latency_ms,
+        updated_at = excluded.updated_at`)
+        .run(
+          model.provider, model.model, task.kind, bucket, reward, semanticSuccess,
+          costRatio, result.durationMs, Date.now(),
+        );
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
       throw error;
     }
     return this.getLearnedProfile(task, model, result.route.predictedFailureProbability);
+  }
+
+  /** Level-1 bandit profiles: manager-role success history per model. */
+  getManagerProfiles(): ManagerRoleProfile[] {
+    return (this.db.prepare(
+      "SELECT provider, model, samples, successes FROM role_stats WHERE role = 'manager' ORDER BY samples DESC",
+    ).all() as Array<Record<string, string | number>>).map((row) => ({
+      provider: String(row.provider),
+      model: String(row.model),
+      samples: Number(row.samples),
+      successes: Number(row.successes),
+    }));
+  }
+
+  /** Fold a finished turn into the manager-role posterior (level-1 learning). */
+  recordManagerTurnOutcome(
+    provider: string,
+    model: string,
+    success: boolean,
+    reward = success ? 1 : 0,
+    durationMs = 0,
+  ): void {
+    this.db.prepare(`INSERT INTO role_stats (
+      provider, model, role, task_kind, complexity_bucket, samples, reward_sum,
+      successes, ewma_cost_ratio, ewma_latency_ms, updated_at
+    ) VALUES (?, ?, 'manager', 'turn', 'any', 1, ?, ?, 1, ?, ?)
+    ON CONFLICT(provider, model, role, task_kind, complexity_bucket) DO UPDATE SET
+      samples = samples + 1,
+      reward_sum = reward_sum + excluded.reward_sum,
+      successes = successes + excluded.successes,
+      ewma_latency_ms = (1 - ${EWMA_ALPHA}) * ewma_latency_ms + ${EWMA_ALPHA} * excluded.ewma_latency_ms,
+      updated_at = excluded.updated_at`)
+      .run(provider, model, reward, success ? 1 : 0, durationMs, Date.now());
+  }
+
+  recordTurnOutcome(record: TurnOutcomeRecord): void {
+    this.db.prepare(`INSERT INTO turn_outcomes (
+      turn_id, bench_id, task_id, manager_provider, manager_model, final_status,
+      total_cost_usd, duration_ms, rework_count, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(turn_id) DO UPDATE SET
+      final_status = excluded.final_status,
+      total_cost_usd = excluded.total_cost_usd,
+      duration_ms = excluded.duration_ms,
+      rework_count = excluded.rework_count,
+      created_at = excluded.created_at`)
+      .run(
+        record.turnId, record.benchId, record.taskId, record.managerProvider, record.managerModel,
+        record.finalStatus, record.totalCostUsd, record.durationMs, record.reworkCount, Date.now(),
+      );
+  }
+
+  /** Verifier calibration: EWMA of accept-but-not-delivered events (leniency). */
+  recordVerifierOutcome(provider: string, model: string, agreedWithJudge: boolean): void {
+    const sample = agreedWithJudge ? 0 : 1;
+    this.db.prepare(`INSERT INTO verifier_calibration (
+      provider, model, leniency_ewma, pairs, updated_at
+    ) VALUES (?, ?, ?, 1, ?)
+    ON CONFLICT(provider, model) DO UPDATE SET
+      leniency_ewma = (1 - ${LENIENCY_ALPHA}) * leniency_ewma + ${LENIENCY_ALPHA} * excluded.leniency_ewma,
+      pairs = pairs + 1,
+      updated_at = excluded.updated_at`)
+      .run(provider, model, sample, Date.now());
+  }
+
+  getLeniency(provider: string, model: string): number {
+    const row = this.db.prepare(
+      "SELECT leniency_ewma FROM verifier_calibration WHERE provider = ? AND model = ?",
+    ).get(provider, model) as { leniency_ewma: number } | undefined;
+    return row ? Math.min(0.9, Math.max(0, Number(row.leniency_ewma))) : 0;
   }
 
   getLearnedProfile(task: DelegatedTask, model: ModelRef, baseFailure: number): LearnedProfile {

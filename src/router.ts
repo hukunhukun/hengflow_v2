@@ -1,7 +1,7 @@
 import type { HengFlowConfig } from "./config.js";
-import type { BudgetController } from "./budget-controller.js";
 import { estimateCost } from "./cost.js";
 import type { UsageLedger } from "./ledger.js";
+import { hashSeed, SeededRandom } from "./rng.js";
 import type {
   DelegatedTask,
   DelegationProposal,
@@ -9,13 +9,22 @@ import type {
   PlanRouteDecision,
   PlanRoutingOptions,
   RouteDecision,
+  TaskKind,
   WorkerId,
 } from "./types.js";
 
-export interface ExplorationState {
-  spentUsd: number;
-  selections: number;
-}
+/**
+ * Router v4: net-utility routing with Thompson sampling.
+ *
+ * Every candidate model w is scored in dollars:
+ *   U(w) = θ̃·V − [ c_w·verbosity_w + (1−θ̃)·c_rework + c_verify ]
+ * where θ̃ is a Beta posterior sample over success probability (learning),
+ * V is the dollar value of one correct completion (defaults to the Manager's
+ * direct cost, self-calibrating), and rework/verify are priced at the
+ * *currently selected* Manager. Selection is argmax U over the Pareto
+ * frontier (dominated candidates dropped). The runner-up becomes the single
+ * bounded fallback. Hard safety gates live in routePlannedTask, unchanged.
+ */
 
 export interface SplitDecision {
   accepted: boolean;
@@ -23,6 +32,17 @@ export interface SplitDecision {
   splitCostUsd: number;
   improvement: number;
   reasons: string[];
+}
+
+const AFFINITY_MATCH_FACTOR = 1.08;
+const AFFINITY_MISS_FACTOR = 0.92;
+/** Beta prior concentration for θ̃; grows with observed samples. */
+const UTILITY_PRIOR_STRENGTH = 10;
+
+function adjustedQualityPrior(model: ModelRef, kind: TaskKind): number {
+  const base = Math.min(0.99, Math.max(0.01, model.quality));
+  const factor = model.affinity?.includes(kind) ? AFFINITY_MATCH_FACTOR : AFFINITY_MISS_FACTOR;
+  return Math.min(0.99, base * factor);
 }
 
 export function evaluateSplit(proposal: DelegationProposal, config: HengFlowConfig): SplitDecision {
@@ -82,10 +102,40 @@ function availableModels(config: HengFlowConfig, available: Set<WorkerId> | read
   return configuredWorkers(config).filter((worker) => available.has(worker.id));
 }
 
-function historicalExecutionFailure(ledger: UsageLedger, model: ModelRef, fallback: number): number {
-  const stats = ledger.getModelStats().find((item) => item.provider === model.provider && item.model === model.model);
-  if (!stats || stats.calls < 3) return fallback;
-  return Math.min(0.9, Math.max(0.01, 1 - stats.successRate));
+export interface UtilityRoutingOptions {
+  /** Deterministic RNG; defaults to a per-task seed so plan/launch agree. */
+  rng?: SeededRandom;
+  /** Dollar value of one correct completion (defaults to Manager direct cost). */
+  valueUsd?: number;
+  /** Manager-side rework cost on worker failure (defaults to valueUsd). */
+  reworkCostUsd?: number;
+  /** Manager verification cost; 0 for passthrough. */
+  verifyCostUsd?: number;
+}
+
+interface ScoredCandidate {
+  model: ModelRef;
+  theta: number;
+  predictedCostUsd: number;
+  failure: number;
+  utility: number;
+  paretoDominated: boolean;
+  learned: ReturnType<UsageLedger["getLearnedProfile"]>;
+}
+
+/** Drop candidates strictly dominated on (quality, cost, failure) posterior means. */
+function paretoFilter(candidates: ScoredCandidate[]): ScoredCandidate[] {
+  return candidates.map((candidate) => ({
+    ...candidate,
+    paretoDominated: candidates.some((other) =>
+      other !== candidate
+      && other.learned.posteriorQuality >= candidate.learned.posteriorQuality
+      && other.predictedCostUsd <= candidate.predictedCostUsd
+      && other.failure <= candidate.failure
+      && (other.learned.posteriorQuality > candidate.learned.posteriorQuality
+        || other.predictedCostUsd < candidate.predictedCostUsd
+        || other.failure < candidate.failure)),
+  }));
 }
 
 export function routeTask(
@@ -93,103 +143,65 @@ export function routeTask(
   config: HengFlowConfig,
   ledger: UsageLedger,
   availableWorkers: Set<WorkerId> | readonly ModelRef[],
-  exploration?: ExplorationState,
-  budget?: BudgetController,
+  options: UtilityRoutingOptions = {},
 ): RouteDecision {
   const candidates = availableModels(config, availableWorkers);
   if (candidates.length === 0) throw new Error("没有已认证且可用的 Worker 模型；请先登录任意受支持的模型提供方");
 
+  const rng = options.rng ?? new SeededRandom(hashSeed("route", task.id));
+  const valueUsd = options.valueUsd
+    ?? estimateCost(config.manager, task.estimatedInputTokens, task.estimatedOutputTokens);
+  const reworkCostUsd = options.reworkCostUsd ?? valueUsd;
+  const verifyCostUsd = options.verifyCostUsd ?? 0;
   const preferred = task.preferredWorker && task.preferredWorker !== "auto" ? task.preferredWorker : undefined;
-  const explorationAllowed = Boolean(
-    exploration && task.risk === "low" && !task.requiresWrite && !preferred
-      && exploration.spentUsd < config.routing.explorationBudgetUsd,
-  );
-  // Hard-feasibility pre-filter: drop candidates whose provider window cannot
-  // fit this call, as long as at least one feasible candidate remains. When
-  // every candidate is infeasible, keep them all so routePlannedTask can
-  // degrade the whole delegation to the Manager.
-  let scoredCandidates = candidates;
-  if (budget && config.budget.hardFeasibility) {
-    const feasible = candidates.filter((model) =>
-      budget.checkFeasibility(estimateCost(model, task.estimatedInputTokens, task.estimatedOutputTokens)
-        * ledger.getLearnedProfile(task, model, 0.1).costRatio, budget.scopesFor(model)).feasible);
-    if (feasible.length > 0) scoredCandidates = feasible;
-  }
-  const scored = scoredCandidates.map((model) => {
-    const id = model.id as WorkerId;
-    const staticPredictedCostUsd = estimateCost(model, task.estimatedInputTokens, task.estimatedOutputTokens);
-    const staticFail = baseFailure(model, task);
-    const executionFailure = historicalExecutionFailure(ledger, model, staticFail);
-    const learned = ledger.getLearnedProfile(task, model, executionFailure);
-    const predictedCostUsd = staticPredictedCostUsd * learned.costRatio;
-    const failure = learned.failureProbability;
-    const quotaPressure = ledger.getQuotaPressure(model.provider);
-    // Shadow price: over-pace budget windows make this candidate's dollars
-    // proportionally more expensive instead of a fixed costWeight.
-    const lambdaMultiplier = budget ? budget.multiplierForModel(model) : 1;
-    const latencyPenalty = learned.samples > 0
-      ? Math.min(2, learned.latencyMs / 60_000)
-      : task.estimatedInputTokens / 1_000_000;
-    const qualityLoss = Math.max(
-      0,
-      1 - learned.posteriorQuality + task.complexity * Math.max(0.03, (1 - model.quality) * 0.35),
-    );
-    const preferenceBonus = preferred === id ? -1.5 : 0;
-    const affinityBonus = model.affinity?.includes(task.kind)
-      ? (task.kind === "simple" ? -1.2 : -0.6)
-      : 0;
-    const economyBonus = task.kind === "simple" && task.complexity < 0.45
-      ? -Math.min(1, 0.1 / Math.max(0.001, staticPredictedCostUsd)) * 0.2 : 0;
-    const potential = Math.max(0, config.routing.explorationMinSamples - learned.samples);
-    const cheapestColdModel = [...candidates].sort((left, right) =>
-      estimateCost(left, task.estimatedInputTokens, task.estimatedOutputTokens)
-      - estimateCost(right, task.estimatedInputTokens, task.estimatedOutputTokens))[0];
-    const explorationBonus = explorationAllowed && id === cheapestColdModel?.id
-      && staticPredictedCostUsd <= config.routing.explorationBudgetUsd - (exploration?.spentUsd ?? 0)
-      ? config.routing.explorationWeight * potential / Math.max(1, config.routing.explorationMinSamples)
-      : 0;
-    const exploitationScore =
-      config.routing.qualityWeight * qualityLoss +
-      config.routing.costWeight * lambdaMultiplier * predictedCostUsd +
-      config.routing.failureWeight * failure +
-      config.routing.quotaWeight * quotaPressure +
-      config.routing.latencyWeight * latencyPenalty +
-      preferenceBonus + affinityBonus + economyBonus;
-    const score = exploitationScore - explorationBonus;
-    return { model, predictedCostUsd, failure, quotaPressure, score, exploitationScore, explorationBonus, potential, learned };
-  }).sort((left, right) => left.score - right.score);
 
-  const selected = scored[0];
-  const fallback = scored[1];
-  const exploitSelected = [...scored].sort((left, right) => left.exploitationScore - right.exploitationScore)[0];
-  const explored = selected.model.id !== exploitSelected.model.id && selected.explorationBonus > 0;
-  if (explored && exploration) {
-    exploration.spentUsd += selected.predictedCostUsd;
-    exploration.selections++;
-  }
+  const scored = paretoFilter(candidates.map((model): ScoredCandidate => {
+    const staticFail = baseFailure(model, task);
+    const learned = ledger.getLearnedProfile(task, model, staticFail);
+    const predictedCostUsd = estimateCost(model, task.estimatedInputTokens, task.estimatedOutputTokens)
+      * Math.max(0.25, learned.costRatio);
+    // Moment-matched Beta: mean = posterior quality, concentration grows with samples.
+    const concentration = UTILITY_PRIOR_STRENGTH + learned.samples;
+    const priorMean = learned.samples > 0
+      ? learned.posteriorQuality
+      : adjustedQualityPrior(model, task.kind);
+    const alpha = Math.max(0.1, priorMean * concentration);
+    const beta = Math.max(0.1, (1 - priorMean) * concentration);
+    const theta = rng.beta(alpha, beta);
+    const preferenceBonus = preferred === model.id ? 0.15 * valueUsd : 0;
+    const utility = theta * valueUsd
+      - (predictedCostUsd + (1 - theta) * reworkCostUsd + verifyCostUsd)
+      + preferenceBonus;
+    return { model, theta, predictedCostUsd, failure: learned.failureProbability, utility, paretoDominated: false, learned };
+  }));
+
+  const eligible = scored.filter((candidate) => !candidate.paretoDominated || scored.length === 1);
+  const ranked = eligible.sort((left, right) => right.utility - left.utility);
+  // Benchmark fixed-mapping policy: forced kind→worker mapping wins outright
+  // (hard gates still apply upstream in routePlannedTask).
+  const forcedId = config.routing.forcedWorkerByKind?.[task.kind];
+  const forcedEntry = forcedId ? ranked.find((entry) => entry.model.id === forcedId) : undefined;
+  // If the preferred worker was dominated, still honor it (advisory, bounded).
+  const preferredEntry = preferred ? ranked.find((entry) => entry.model.id === preferred) : undefined;
+  const selected = forcedEntry ?? preferredEntry ?? ranked[0];
+  const fallback = ranked.find((entry) => entry !== selected);
+
   const explanation = [
     `任务类型=${task.kind}，复杂度=${task.complexity.toFixed(2)}`,
-    `预计影子成本=$${selected.predictedCostUsd.toFixed(5)}`,
-    `预计失败率=${(selected.failure * 100).toFixed(1)}%`,
-    `当前额度压力=${(selected.quotaPressure * 100).toFixed(1)}%`,
+    `任务价值 V=$${valueUsd.toFixed(5)}，TS 抽样成功率=${(selected.theta * 100).toFixed(1)}%`,
+    `全路径预测=$${(selected.predictedCostUsd + (1 - selected.theta) * reworkCostUsd + verifyCostUsd).toFixed(5)}（执行=$${selected.predictedCostUsd.toFixed(5)}）`,
+    `净效用=$${selected.utility.toFixed(5)}`,
   ];
   if (selected.learned.samples > 0) {
     explanation.push(
       `已学习同类样本=${selected.learned.samples}，后验质量=${selected.learned.posteriorQuality.toFixed(3)}，成本倍率=${selected.learned.costRatio.toFixed(2)}`,
     );
   } else {
-    explanation.push("尚无同类验收样本，使用冷启动先验");
+    explanation.push("尚无同类验收样本，使用亲和度调整先验");
   }
-  if (budget) {
-    const lambda = budget.multiplierForModel(selected.model);
-    if (lambda > 1.01) explanation.push(`预算影子价格×${lambda.toFixed(2)}（超速窗口内美元变贵）`);
-  }
-  if (explored) {
-    explanation.push(
-      `有限探索=on，样本缺口=${selected.potential}，预算累计=$${exploration!.spentUsd.toFixed(5)}`,
-    );
-  }
-  if (preferred) explanation.push(`Manager 指定偏好=${preferred}`);
+  if (selected.paretoDominated) explanation.push("候选被帕累托支配但为指定选择");
+  if (forcedEntry) explanation.push(`固定映射=${forcedId}`);
+  if (preferred && selected.model.id === preferred) explanation.push(`Manager 指定偏好=${preferred}`);
   if (fallback) explanation.push(`失败时仅降级一次到 ${fallback.model.provider}/${fallback.model.model}`);
   if (fallback?.learned.samples) {
     explanation.push(
@@ -201,7 +213,7 @@ export function routeTask(
     taskId: task.id,
     selected: selected.model,
     fallback: fallback?.model,
-    score: selected.score,
+    score: selected.utility,
     predictedCostUsd: selected.predictedCostUsd,
     predictedFailureProbability: selected.failure,
     explanation,
@@ -210,7 +222,7 @@ export function routeTask(
 
 /**
  * Route every planned item, including the Manager option. Safety constraints
- * are hard gates; learned Worker scores only operate inside those boundaries.
+ * are hard gates; learned Worker utilities only operate inside those boundaries.
  */
 export function routePlannedTask(
   task: DelegatedTask,
@@ -218,8 +230,7 @@ export function routePlannedTask(
   ledger: UsageLedger,
   availableWorkers: Set<WorkerId> | readonly ModelRef[],
   options: PlanRoutingOptions = { returnPolicy: "manager_synthesis" },
-  exploration?: ExplorationState,
-  budget?: BudgetController,
+  rng?: SeededRandom,
 ): PlanRouteDecision {
   const directExecutionCostUsd = estimateCost(
     config.manager,
@@ -242,14 +253,21 @@ export function routePlannedTask(
   if (task.risk === "high") return manager("高风险任务由 Manager 保留");
   if (task.requiresWrite) return manager("任务需要修改文件或外部状态，当前只读 Worker 不可执行");
   if (task.kind === "synthesis") return manager("最终综合与责任判断由 Manager 保留");
-  if (availableModels(config, availableWorkers).length === 0) return manager("没有已认证 Worker，回退 Manager");
+  const workerPool = availableModels(config, availableWorkers);
+  if (workerPool.length === 0) return manager("没有已认证 Worker，回退 Manager");
 
-  const workerRoute = routeTask(task, config, ledger, availableWorkers, exploration, budget);
   const verificationInput = Math.min(1_600, Math.max(250, task.estimatedOutputTokens));
   const verificationOutput = Math.min(350, Math.max(120, task.estimatedOutputTokens * 0.2));
   const verificationCost = options.returnPolicy === "manager_synthesis"
     ? estimateCost(config.manager, verificationInput, verificationOutput)
     : 0;
+
+  const workerRoute = routeTask(task, config, ledger, availableWorkers, {
+    rng,
+    valueUsd: directExecutionCostUsd,
+    reworkCostUsd: directExecutionCostUsd,
+    verifyCostUsd: verificationCost,
+  });
   const expectedReworkCostUsd = workerRoute.predictedFailureProbability * directExecutionCostUsd;
   const orchestrationCostUsd = planningCostShareUsd + verificationCost;
   const delegatedCostUsd = orchestrationCostUsd + workerRoute.predictedCostUsd + expectedReworkCostUsd;
@@ -266,12 +284,6 @@ export function routePlannedTask(
     return manager(
       `委派预计改善 ${(improvement * 100).toFixed(1)}%，低于 ${(config.routing.splitImprovementMargin * 100).toFixed(0)}% 门槛`,
     );
-  }
-  if (budget) {
-    const feasibility = budget.checkFeasibility(delegatedCostUsd, budget.scopesFor(workerRoute.selected));
-    if (!feasibility.feasible) {
-      return manager(`预算不可行（${feasibility.reason}）；已降级为 Manager 直接执行`);
-    }
   }
 
   return {

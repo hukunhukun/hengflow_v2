@@ -6,6 +6,7 @@ import test from "node:test";
 import { DEFAULT_CONFIG } from "../config.js";
 import { emptyUsage } from "../cost.js";
 import { UsageLedger } from "../ledger.js";
+import { SeededRandom } from "../rng.js";
 import { evaluateSplit, routePlannedTask, routeTask } from "../router.js";
 import type { DelegatedTask, ModelRef, RouteDecision, WorkerResult } from "../types.js";
 
@@ -159,22 +160,42 @@ test("keeps writes and high-risk planned items on the Manager", () => {
   store.close();
 });
 
-test("bounded sample-deficit exploration gives under-sampled DeepSeek a finite chance", () => {
+test("Thompson sampling explores the cheap model cold, then converges after learning", () => {
   const store = ledger();
   const task: DelegatedTask = {
     id: "explore-research", objective: "research bounded facts", kind: "research", risk: "low", complexity: 0.5,
     estimatedInputTokens: 10_000, estimatedOutputTokens: 1000,
   };
-  const exploit = routeTask(task, DEFAULT_CONFIG, store, new Set(["deepseek", "glm"]));
-  const state = { spentUsd: 0, selections: 0 };
-  const explored = routeTask(task, DEFAULT_CONFIG, store, new Set(["deepseek", "glm"]), state);
-  assert.equal(exploit.selected.id, "glm");
-  assert.equal(explored.selected.id, "deepseek");
-  assert.equal(state.selections, 1);
-  assert.ok(state.spentUsd > 0 && state.spentUsd <= DEFAULT_CONFIG.routing.explorationBudgetUsd);
-  assert.match(explored.explanation.join(" "), /样本缺口/);
-  state.spentUsd = DEFAULT_CONFIG.routing.explorationBudgetUsd;
-  assert.equal(routeTask(task, DEFAULT_CONFIG, store, new Set(["deepseek", "glm"]), state).selected.id, "glm");
+  // Cold start: posterior variance gives the cheaper under-sampled model a
+  // finite share of seeds (exploration emerges from sampling, no budget knob).
+  let deepseekPicks = 0;
+  for (let seed = 0; seed < 24; seed++) {
+    const route = routeTask(task, DEFAULT_CONFIG, store, new Set(["deepseek", "glm"]), {
+      rng: new SeededRandom(seed),
+    });
+    if (route.selected.id === "deepseek") deepseekPicks += 1;
+  }
+  assert.ok(deepseekPicks >= 1 && deepseekPicks <= 23, `expected mixed exploration, got ${deepseekPicks}/24`);
+
+  // After cheap-model failures are learned, every seed converges to glm.
+  const coldRoute = routeTask(task, DEFAULT_CONFIG, store, new Set(["deepseek", "glm"]));
+  for (let index = 0; index < 10; index++) {
+    const result: WorkerResult = {
+      task, route: { ...coldRoute, selected: DEFAULT_CONFIG.workers.deepseek }, output: "wrong",
+      exitCode: 0, durationMs: 1000,
+      usage: { ...emptyUsage(), input: 10_000, output: 1000, totalTokens: 11_000 },
+      model: DEFAULT_CONFIG.workers.deepseek.model, stopReason: "stop", retried: false,
+    };
+    store.recordOutcome(`delegation-${index}`, result, {
+      taskId: task.id, status: "rejected", quality: 0, confidence: 1,
+    }, DEFAULT_CONFIG.workers.deepseek);
+  }
+  for (let seed = 0; seed < 24; seed++) {
+    const route = routeTask(task, DEFAULT_CONFIG, store, new Set(["deepseek", "glm"]), {
+      rng: new SeededRandom(seed),
+    });
+    assert.equal(route.selected.id, "glm", `seed=${seed} should converge after learning`);
+  }
   store.close();
 });
 

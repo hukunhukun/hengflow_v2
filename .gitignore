@@ -9,3 +9,10 @@ dist/
 .vscode/
 .hengflow/
 api_keys.json
+bench/runs/
+bench/train/
+bench/he-train/
+bench/he-eval/
+bench/eval/
+bench/sanity/
+bench/proxycheck/

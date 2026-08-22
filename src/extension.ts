@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import type { ExtensionAPI, ExtensionContext, Theme } from "./runtime/agent.js";
 import { Type } from "typebox";
 import { saveModelSelection, type HengFlowConfig } from "./config.js";
-import { estimateCost, emptyUsage, usageShadowCost, workerShadowCost } from "./cost.js";
+import { estimateCost, usageShadowCost, workerShadowCost } from "./cost.js";
 import {
   renderDashboard,
   renderHengFlowFooter,
@@ -11,8 +11,7 @@ import {
   type PanelPalette,
 } from "./dashboard.js";
 import { UsageLedger } from "./ledger.js";
-import { evaluateSplit, routePlannedTask, type ExplorationState } from "./router.js";
-import { BudgetController } from "./budget-controller.js";
+import { evaluateSplit, routePlannedTask } from "./router.js";
 import { buildTaskContext, chooseContextPolicy } from "./context-policy.js";
 import { validateTaskGraph } from "./graph.js";
 import { StageOrchestrator } from "./orchestrator.js";
@@ -49,6 +48,8 @@ import { fetchAllUsage, latestQuotaReports, parseCodexHeaders, renderUsagePanel 
 import { runWorker, snapshotParentContext, withInheritedContextCost } from "./worker.js";
 import { discoverWorkers, modelRefFromRuntime, workerDisplayName } from "./model-catalog.js";
 import { managerInstructions, routingGate, shouldBlockTool } from "./manager-policy.js";
+import { managerKey, selectManager } from "./manager-selector.js";
+import { hashSeed, SeededRandom } from "./rng.js";
 
 const TaskSchema = Type.Object({
   id: Type.String({ description: "Stable short task ID" }),
@@ -129,21 +130,6 @@ interface ActiveStage {
   kick: () => void;
 }
 
-function budgetBlockedResult(task: DelegatedTask, route: RouteDecision, message: string): WorkerResult {
-  return {
-    task,
-    route,
-    output: message,
-    exitCode: 1,
-    durationMs: 0,
-    usage: emptyUsage(),
-    stopReason: "budget",
-    error: message,
-    retried: false,
-    attempts: [],
-  };
-}
-
 function formatWorkerResults(results: Awaited<ReturnType<typeof runWorker>>[]): string {
   return results.map((result) => {
     const status = result.exitCode === 0 && result.stopReason !== "error" ? "ok" : "failed";
@@ -188,6 +174,13 @@ export function createHengFlowExtension(config: HengFlowConfig) {
   return function hengflowExtension(pi: ExtensionAPI): void {
     const ledger = new UsageLedger();
     let managerTurnStartedAt = 0;
+    let turnCounter = 0;
+    let championId: string | undefined;
+    const writeExploration = new Map<string, { turns: number; failures: number }>();
+    let turnStartedAt = 0;
+    let turnReworkCount = 0;
+    let verifiedDelegations = 0;
+    let lastManagerExploratory: string | undefined;
     let taskCallBaseline: number | undefined;
     let activePrompt = "";
     let planRequired = false;
@@ -207,8 +200,10 @@ export function createHengFlowExtension(config: HengFlowConfig) {
     let quotaAbort: AbortController | undefined;
     const pendingDelegations = new Map<string, Map<string, WorkerResult>>();
     const activeStages = new Map<string, ActiveStage>();
-    const exploration: ExplorationState = { spentUsd: 0, selections: 0 };
-    const budget = new BudgetController(ledger, config);
+    const bench = config.bench;
+    const benchSingle = bench?.variant === "single";
+    const benchFrozen = Boolean(bench?.freezeLearning);
+    const routeSeed = (taskId: string) => new SeededRandom(hashSeed("route", taskId, String(bench?.seed ?? 0)));
     let economicsOverridden = false;
 
     // Keep rendering summaries from older sessions, but new runs no longer append a duplicate completed board.
@@ -367,43 +362,93 @@ export function createHengFlowExtension(config: HengFlowConfig) {
       });
     };
 
-    const enforceManager = async (ctx: ExtensionContext) => {
-      if (!config.modelsConfigured) {
-        ctx.ui.notify("首次使用请执行 /models，明确选择并保存 Manager 与 Worker", "error");
+    const poolAuthenticated = (ctx: ExtensionContext) => config.pool.filter((model) =>
+      ctx.modelRegistry.getAvailable().some(
+        (available) => available.provider === model.provider && available.id === model.model,
+      ));
+
+    // v4: the Manager is selected per turn from the authenticated pool via a
+    // seeded sticky-Thompson selector. The chosen model overwrites
+    // config.manager so router cost constants and worker-pool exclusion follow
+    // automatically; the pool anchor remains the safety floor.
+    const enforcePool = async (ctx: ExtensionContext, prompt: string): Promise<boolean> => {
+      if (!config.modelsConfigured || config.pool.length < 2) {
+        ctx.ui.notify("HengFlow v4：请先执行 /models 配置至少 2 个模型（首位为锚点）", "error");
         return false;
       }
-      const manager = ctx.modelRegistry.getAvailable().find(
-        (model) => model.provider === config.manager.provider && model.id === config.manager.model,
-      );
-      if (!manager) {
+      const authenticated = poolAuthenticated(ctx);
+      if (authenticated.length < 2) {
         ctx.ui.notify(
-          `已配置的 Manager 未认证：${config.manager.provider}/${config.manager.model}；请执行 /login 或 /models`,
+          `请求已阻止：已认证模型 ${authenticated.length}/2；请执行 /login 或 /models`,
           "error",
         );
         return false;
       }
-      if (ctx.model?.provider !== config.manager.provider || ctx.model?.id !== config.manager.model) {
-        const changed = await pi.setModel(manager);
+      const parentContext = snapshotParentContext(
+        ctx.sessionManager.getEntries(),
+        ctx.sessionManager.getLeafId(),
+        ctx.sessionManager.getSessionFile(),
+      );
+      const managerProfiles = new Map(ledger.getManagerProfiles().map(
+        (profile) => [`${profile.provider}/${profile.model}`, profile] as const,
+      ));
+      const profiles = new Map(authenticated.map((model) => {
+        const profile = managerProfiles.get(`${model.provider}/${model.model}`);
+        return [`${model.provider}/${model.model}`, {
+          model,
+          samples: profile?.samples ?? 0,
+          successes: profile?.successes ?? 0,
+        }] as const;
+      }));
+      const rng = new SeededRandom(hashSeed(String(turnCounter), prompt, championId ?? "-"));
+      const selection = selectManager({
+        pool: authenticated,
+        profiles,
+        requiresWrite: requiresPlan(prompt),
+        sessionHistoryTokens: parentContext.estimatedTokens,
+        championId,
+        rng,
+        explorationLedger: writeExploration,
+      });
+      championId = selection.nextChampionId;
+      turnCounter += 1;
+      lastManagerExploratory = selection.exploratory ? selection.selectedId : undefined;
+      const chosen = selection.selected;
+      config.manager = chosen;
+      const runtime = ctx.modelRegistry.getAvailable().find(
+        (model) => model.provider === chosen.provider && model.id === chosen.model,
+      );
+      if (!runtime) {
+        ctx.ui.notify(`选中的 Manager ${chosen.provider}/${chosen.model} 已不可用；请重新登录后重试`, "error");
+        return false;
+      }
+      if (ctx.model?.provider !== chosen.provider || ctx.model?.id !== chosen.model) {
+        const changed = await pi.setModel(runtime);
         if (!changed) {
-          ctx.ui.notify(`请重新登录 ${config.manager.provider}`, "error");
+          ctx.ui.notify(`无法切换 Manager 到 ${chosen.provider}/${chosen.model}`, "error");
           return false;
         }
       }
-      pi.setThinkingLevel(config.manager.thinking);
+      pi.setThinkingLevel(chosen.thinking);
+      ledger.recordDecision({
+        taskId: `manager:turn${turnCounter}`,
+        selected: chosen,
+        score: selection.sampledUtilityUsd,
+        predictedCostUsd: selection.planningCostUsd,
+        predictedFailureProbability: selection.failureProbability,
+        explanation: [selection.reason],
+      }, "manager");
       return true;
     };
 
     pi.on("input", (_event, ctx) => {
       if (!config.modelsConfigured) {
-        ctx.ui.notify("请求已阻止：请先执行 /login 和 /models 完成强制模型配置", "error");
+        ctx.ui.notify("请求已阻止：请先执行 /login 和 /models 完成模型配置", "error");
         return { action: "handled" };
       }
-      const managerAvailable = ctx.modelRegistry.getAvailable().some(
-        (model) => model.provider === config.manager.provider && model.id === config.manager.model,
-      );
-      if (!managerAvailable) {
+      if (poolAuthenticated(ctx).length < 2) {
         ctx.ui.notify(
-          `请求已阻止：Manager ${config.manager.provider}/${config.manager.model} 未认证；请执行 /login 或 /models`,
+          "请求已阻止：HengFlow v4 需要至少 2 个已认证模型；请执行 /login 或 /models",
           "error",
         );
         return { action: "handled" };
@@ -412,8 +457,10 @@ export function createHengFlowExtension(config: HengFlowConfig) {
     });
 
     pi.on("session_start", async (_event, ctx) => {
-      const ready = await enforceManager(ctx);
-      managerReady = ready;
+      // Manager selection happens per turn in before_agent_start; here we
+      // only validate the pool so misconfiguration surfaces before input.
+      managerReady = benchSingle
+        || (config.modelsConfigured && poolAuthenticated(ctx).length >= 2);
       const workers = availableWorkers(ctx, config);
       discoveredWorkerModels = workers;
       workerAvailability = workers.length ? workers.map(workerDisplayName).slice(0, 3).join("/") : "none";
@@ -428,27 +475,21 @@ export function createHengFlowExtension(config: HengFlowConfig) {
     });
 
     pi.on("before_agent_start", async (event, ctx) => {
-      const ready = await enforceManager(ctx);
-      managerReady = ready;
-      if (!ready) throw new Error("HengFlow 模型尚未配置或不可用；请先执行 /login 和 /models");
-      void refreshQuota(ctx);
+      turnStartedAt = Date.now();
+      turnReworkCount = 0;
+      verifiedDelegations = 0;
+      if (!benchSingle) {
+        const ready = await enforcePool(ctx, event.prompt);
+        managerReady = ready;
+        if (!ready) throw new Error("HengFlow 模型尚未配置或不可用；请先执行 /login 和 /models");
+        void refreshQuota(ctx);
+      }
       taskCallBaseline ??= ledger.getLastCallId();
       activePrompt = event.prompt;
-      footerPhase = "planning";
+      footerPhase = benchSingle ? "running" : "planning";
       planRequired = requiresPlan(event.prompt);
       planCreated = false;
       economicsOverridden = false;
-      budget.registerSession(config.budget.sessionUsdLimit);
-      const budgetProviders = new Set([
-        config.manager.provider,
-        ...discoveredWorkerModels.map((worker) => worker.provider),
-        ...Object.keys(config.budget.providerLimitsUsd),
-      ]);
-      for (const provider of budgetProviders) {
-        const limit = config.budget.providerLimitsUsd[provider];
-        if (limit && limit > 0) budget.registerProvider(provider, limit);
-      }
-      budget.advanceTracked();
       lastManagerStopReason = undefined;
       currentBoard = undefined;
       clearLivePanel(ctx);
@@ -458,10 +499,13 @@ export function createHengFlowExtension(config: HengFlowConfig) {
         ctx.ui.setWidget("hengflow-tasks", undefined);
       }
       publishBoard(ctx, false);
-      return { systemPrompt: `${event.systemPrompt}\n\n${managerInstructions(config)}\n\n${routingGate(planRequired)}` };
+      return benchSingle
+        ? { systemPrompt: event.systemPrompt }
+        : { systemPrompt: `${event.systemPrompt}\n\n${managerInstructions(config)}\n\n${routingGate(planRequired)}` };
     });
 
     pi.on("tool_call", (event) => {
+      if (benchSingle) return undefined;
       const reason = shouldBlockTool(event.toolName, planCreated);
       return reason ? { block: true, reason } : undefined;
     });
@@ -486,13 +530,12 @@ export function createHengFlowExtension(config: HengFlowConfig) {
       };
       ledger.recordManagerCall(
         config.manager.provider,
-        message.model || config.manager.model,
+        config.manager.model,
         usage,
         usageShadowCost(config.manager, usage),
         message.stopReason,
         managerTurnStartedAt ? Date.now() - managerTurnStartedAt : 0,
       );
-      budget.advanceTracked();
     });
 
     pi.on("after_provider_response", (event, ctx) => {
@@ -510,6 +553,9 @@ export function createHengFlowExtension(config: HengFlowConfig) {
       parameters: ExecutionPlanSchema,
       executionMode: "sequential",
       async execute(_toolCallId, rawParams, _signal, onUpdate, ctx) {
+        if (benchSingle) {
+          return { content: [{ type: "text", text: "benchmark single 模式：编排工具未启用。" }], details: {}, isError: true };
+        }
         if (planCreated) {
           return {
             content: [{ type: "text", text: "当前请求已提交执行图；不要重复规划。" }],
@@ -611,7 +657,7 @@ export function createHengFlowExtension(config: HengFlowConfig) {
           const decision = routePlannedTask(task, config, ledger, eligibleWorkers, {
             returnPolicy: params.returnPolicy,
             planningCostShareUsd,
-          }, exploration, budget);
+          }, routeSeed(task.id));
           recordPlanDecision(decision);
           return { task, decision };
         });
@@ -679,8 +725,8 @@ export function createHengFlowExtension(config: HengFlowConfig) {
           },
         );
 
-        // Lazy routing (P2): plan-time decisions are tentative; the launch
-        // callback re-routes with the freshest budget/learning state and the
+        // Lazy routing: plan-time decisions are tentative; the launch
+        // callback re-routes with the freshest learning state and the
         // actual dependency outputs available by then.
         const launchRoutedTask = async (
           task: PlannedTask,
@@ -690,7 +736,7 @@ export function createHengFlowExtension(config: HengFlowConfig) {
           const fresh = routePlannedTask(task, config, ledger, eligible, {
             returnPolicy: params.returnPolicy,
             planningCostShareUsd,
-          }, exploration, budget);
+          }, routeSeed(task.id));
           const runPlanned = () => runWorker(
             task,
             planDecision.workerRoute!,
@@ -701,7 +747,7 @@ export function createHengFlowExtension(config: HengFlowConfig) {
             (progress) => publishWorkerProgress(ctx, progress),
           );
           if (fresh.route !== "manager" && fresh.workerRoute) {
-            ledger.recordDecision(fresh.workerRoute, "launch");
+            ledger.recordDecision(fresh.workerRoute, "launch", { kind: task.kind, complexity: task.complexity });
             const rerouted = fresh.model.provider !== planDecision.model.provider
               || fresh.model.model !== planDecision.model.model;
             if (rerouted && currentBoard) {
@@ -711,12 +757,6 @@ export function createHengFlowExtension(config: HengFlowConfig) {
               });
               publishBoard(ctx, false);
             }
-            const feasibility = budget.checkFeasibility(fresh.predictedCostUsd, budget.scopesFor(fresh.model));
-            if (!feasibility.feasible) {
-              ctx.ui.notify(`任务 ${task.id} ${feasibility.reason}；节点已暂停，等待 Manager 决策`, "error");
-              return budgetBlockedResult(task, fresh.workerRoute, `${feasibility.reason}；DAG 节点已暂停`);
-            }
-            await budget.waitForAdmission(budget.scopesFor(fresh.model), controller.signal);
             return runWorker(
               task,
               fresh.workerRoute,
@@ -727,12 +767,8 @@ export function createHengFlowExtension(config: HengFlowConfig) {
               (progress) => publishWorkerProgress(ctx, progress),
             );
           }
-          if (fresh.explanation[0]?.includes("预算不可行")) {
-            ctx.ui.notify(`任务 ${task.id} 在启动时预算不可行；节点已暂停，等待 Manager 决策`, "error");
-            return budgetBlockedResult(task, planDecision.workerRoute!, fresh.explanation.join("；"));
-          }
           // Quality-margin flips at launch keep the plan-time commitment to
-          // avoid thrashing; only budget infeasibility pauses the node.
+          // avoid thrashing.
           return runPlanned();
         };
 
@@ -773,6 +809,9 @@ export function createHengFlowExtension(config: HengFlowConfig) {
       parameters: CollectStageSchema,
       executionMode: "sequential",
       async execute(_toolCallId, rawParams, signal, onUpdate) {
+        if (benchSingle) {
+          return { content: [{ type: "text", text: "benchmark single 模式：编排工具未启用。" }], details: {}, isError: true };
+        }
         const { delegationId } = rawParams as { delegationId: string };
         const stage = activeStages.get(delegationId);
         if (!stage) {
@@ -812,6 +851,9 @@ export function createHengFlowExtension(config: HengFlowConfig) {
       description: "Report Manager verification outcomes for delegated tasks so bounded routing statistics improve.",
       parameters: ReportOutcomesSchema,
       async execute(_toolCallId, rawParams, _signal, _onUpdate, ctx) {
+        if (benchSingle) {
+          return { content: [{ type: "text", text: "benchmark single 模式：编排工具未启用。" }], details: { updated: [] }, isError: true };
+        }
         const params = rawParams as { delegationId: string; outcomes: TaskOutcome[] };
         const pending = pendingDelegations.get(params.delegationId);
         if (!pending) {
@@ -834,9 +876,13 @@ export function createHengFlowExtension(config: HengFlowConfig) {
           };
         }
 
-        const updated = params.outcomes.map((outcome) => {
+        verifiedDelegations += params.outcomes.length;
+        turnReworkCount += params.outcomes.filter((outcome) =>
+          outcome.status === "reworked" || outcome.status === "rejected" || outcome.status === "failed").length;
+        const leniencyDiscount = 1 - ledger.getLeniency(config.manager.provider, config.manager.model);
+        const updated: OutcomeReportDetails["updated"] = benchFrozen || config.bench ? [] : params.outcomes.map((outcome) => {
           const result = pending.get(outcome.taskId)!;
-          const profile = ledger.recordOutcome(params.delegationId, result, outcome, result.route.selected);
+          const profile = ledger.recordOutcome(params.delegationId, result, outcome, result.route.selected, leniencyDiscount);
           return { taskId: outcome.taskId, model: result.route.selected.model, status: outcome.status, profile };
         });
         pendingDelegations.delete(params.delegationId);
@@ -855,9 +901,11 @@ export function createHengFlowExtension(config: HengFlowConfig) {
         return {
           content: [{
             type: "text",
-            text: updated.map((item) =>
-              `${item.taskId}: ${item.status}; ${item.model} samples=${item.profile.samples} posterior_quality=${item.profile.posteriorQuality.toFixed(3)} cost×${item.profile.costRatio.toFixed(2)}`,
-            ).join("\n"),
+            text: updated.length
+              ? updated.map((item) =>
+                `${item.taskId}: ${item.status}; ${item.model} samples=${item.profile.samples} posterior_quality=${item.profile.posteriorQuality.toFixed(3)} cost×${item.profile.costRatio.toFixed(2)}`,
+              ).join("\n")
+              : "冻结学习模式：验收已记录，未更新策略统计。",
           }],
           details: { updated },
         };
@@ -871,6 +919,9 @@ export function createHengFlowExtension(config: HengFlowConfig) {
       parameters: UpdateTaskSchema,
       executionMode: "sequential",
       async execute(_toolCallId, rawParams, _signal, _onUpdate, ctx) {
+        if (benchSingle) {
+          return { content: [{ type: "text", text: "benchmark single 模式：编排工具未启用。" }], details: {}, isError: true };
+        }
         const params = rawParams as { taskId: string; status: TaskStatus; note?: string };
         const item = currentBoard?.items.find((candidate) => candidate.id === params.taskId);
         if (!currentBoard || !item) {
@@ -998,6 +1049,7 @@ export function createHengFlowExtension(config: HengFlowConfig) {
         config.modelsConfigured = true;
         config.manager = manager;
         config.workers = workers;
+        config.pool = [manager, ...Object.values(workers)];
         const runtimeManager = ctx.modelRegistry.find(manager.provider, manager.model);
         managerReady = runtimeManager ? await pi.setModel(runtimeManager) : false;
         if (managerReady) pi.setThinkingLevel(manager.thinking);
@@ -1054,8 +1106,8 @@ export function createHengFlowExtension(config: HengFlowConfig) {
           `Manager: ${config.manager.provider}/${config.manager.model}:${config.manager.thinking}`,
           `Workers (${workers.length}): ${workers.map((worker) => `${worker.id}:${worker.thinking}`).join(", ") || "none selected or authenticated"}`,
           `Routing: margin=${(config.routing.splitImprovementMargin * 100).toFixed(0)}% concurrency=${config.routing.maxConcurrency} maxTasks=${config.routing.maxTasks} passthroughFailure≤${(config.routing.passthroughFailureLimit * 100).toFixed(0)}%`,
-          `Exploration: 样本缺口探索 weight=${config.routing.explorationWeight} minSamples=${config.routing.explorationMinSamples} spent=$${exploration.spentUsd.toFixed(5)}/$${config.routing.explorationBudgetUsd.toFixed(2)} selections=${exploration.selections}`,
-          `Budget: ${budget.snapshot().map((row) => `${row.scope} $${row.spentUsd.toFixed(3)}/$${row.limitUsd.toFixed(2)} λ×${row.lambdaMultiplier.toFixed(2)} debt=$${row.debtUsd.toFixed(3)}`).join("; ") || "未配置预算窗口"}`,
+          `ManagerPool: ${ledger.getManagerProfiles().map((profile) => `${profile.provider}/${profile.model} ${profile.successes}/${profile.samples}`).join(", ") || "尚无轮级样本"}`,
+          `Verifier: leniency=${ledger.getLeniency(config.manager.provider, config.manager.model).toFixed(2)}`,
           `Calibration: ${(() => { const c = ledger.getCalibration(); return c.pairs ? `pairs=${c.pairs} brier=${c.brierFailure.toFixed(3)} costBias=${c.costBiasRatio.toFixed(2)}` : "暂无已验收样本"; })()}`,
         ].join("\n");
         ctx.ui.notify(text, "info");
@@ -1086,9 +1138,52 @@ export function createHengFlowExtension(config: HengFlowConfig) {
     });
 
     pi.on("agent_settled", (_event, ctx) => {
-      budget.advanceTracked();
+      const turnOk = lastManagerStopReason !== "error" && lastManagerStopReason !== "aborted";
+      const boardFailed = Boolean(currentBoard?.items.some((item) => item.status === "failed"));
+      const finalStatus = !turnOk ? "failed" : boardFailed || turnReworkCount > 0 ? "reworked" : "accepted";
+      const turnDurationMs = turnStartedAt ? Date.now() - turnStartedAt : 0;
+      // Exploratory write turns end on the first failure — the challenger
+      // loses its allowance and the next turn re-anchors.
+      if (lastManagerExploratory && (lastManagerStopReason === "error" || lastManagerStopReason === "aborted")) {
+        const used = writeExploration.get(lastManagerExploratory);
+        if (used) used.failures += 1;
+      }
+      if (config.bench) {
+        ledger.recordTurnOutcome({
+          turnId: `bench:${bench!.taskId ?? "task"}:${turnCounter}`,
+          benchId: bench!.benchId ?? "bench",
+          taskId: bench!.taskId ?? activePrompt.slice(0, 60),
+          managerProvider: config.manager.provider,
+          managerModel: config.manager.model,
+          finalStatus,
+          totalCostUsd: taskCallBaseline === undefined ? 0 : ledger.getCostBreakdown(taskCallBaseline).shadowCostUsd,
+          durationMs: turnDurationMs,
+          reworkCount: turnReworkCount,
+        });
+      }
+      // Bench training defers ALL learning to the runner, which owns the
+      // external judge result (confidence 1.0). In-process signals here would
+      // double-count and bias the same cells.
+      if (!config.bench && !benchSingle && !benchFrozen) {
+        const succeeded = finalStatus === "accepted";
+        ledger.recordManagerTurnOutcome(
+          config.manager.provider,
+          config.manager.model,
+          succeeded,
+          succeeded ? 1 : 0,
+          turnDurationMs,
+        );
+        if (lastManagerExploratory && !succeeded) {
+          const used = writeExploration.get(lastManagerExploratory);
+          if (used) used.failures += 1;
+        }
+        if (verifiedDelegations > 0) {
+          ledger.recordVerifierOutcome(config.manager.provider, config.manager.model, succeeded);
+        }
+      }
+      lastManagerExploratory = undefined;
       if (currentBoard) {
-        if (lastManagerStopReason !== "error" && lastManagerStopReason !== "aborted") {
+        if (turnOk) {
           currentBoard = completeVerifiedWorkerTasks(currentBoard);
         }
         currentBoard = completeOpenManagerTasks(currentBoard);
@@ -1099,14 +1194,14 @@ export function createHengFlowExtension(config: HengFlowConfig) {
       for (const [delegationId, pending] of pendingDelegations) {
         for (const result of pending.values()) {
           const ok = result.exitCode === 0 && result.stopReason !== "error" && result.stopReason !== "aborted";
-          if (!ok) continue;
+          if (!ok || benchFrozen || config.bench) continue;
           ledger.recordOutcome(delegationId, result, {
             taskId: result.task.id,
             status: "accepted",
             quality: 0.8,
             confidence: 0.35,
             reason: "阶段正常结束后的保守自动回流",
-          }, result.route.selected);
+          }, result.route.selected, 1 - ledger.getLeniency(config.manager.provider, config.manager.model));
         }
       }
       pendingDelegations.clear();

@@ -173,36 +173,3 @@ test("calibration joins route_decisions with realized outcomes", () => {
   ledger.close();
 });
 
-test("provider-budget pressure reroutes expensive model to the cheap one", () => {
-  const ledger = tempLedger();
-  const config: HengFlowConfig = structuredClone(DEFAULT_CONFIG);
-  config.budget.providerLimitsUsd = { "zai-coding-cn": 0.5 };
-  const controller = new BudgetController(ledger, config);
-  controller.registerSession(0);
-  controller.registerProvider("zai-coding-cn", 0.5);
-  spend(ledger, "zai-coding-cn", 0.49);
-  const task: DelegatedTask = {
-    id: "reroute", objective: "research topic", kind: "research", risk: "low", complexity: 0.5,
-    estimatedInputTokens: 10_000, estimatedOutputTokens: 1_000,
-  };
-  const route = routeTask(task, config, ledger, new Set(["deepseek", "glm"]), undefined, controller);
-  assert.equal(route.selected.id, "deepseek");
-  ledger.close();
-});
-
-test("exhausted session budget degrades delegation to Manager", () => {
-  const ledger = tempLedger();
-  const config: HengFlowConfig = structuredClone(DEFAULT_CONFIG);
-  config.budget.sessionUsdLimit = 0.01;
-  const controller = new BudgetController(ledger, config);
-  controller.registerSession(0.01);
-  spend(ledger, "zai-coding-cn", 0.009);
-  const task: DelegatedTask = {
-    id: "degrade", objective: "research topic", kind: "research", risk: "low", complexity: 0.5,
-    estimatedInputTokens: 10_000, estimatedOutputTokens: 1_000,
-  };
-  const decision = routePlannedTask(task, config, ledger, new Set(["deepseek", "glm"]), { returnPolicy: "manager_synthesis" }, undefined, controller);
-  assert.equal(decision.route, "manager");
-  assert.match(decision.explanation.join(" "), /预算不可行/);
-  ledger.close();
-});
